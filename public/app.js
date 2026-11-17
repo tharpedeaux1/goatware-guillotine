@@ -8,6 +8,7 @@ const state = {
   dirty: false,
   filter: { pos: '', q: '', all: false },
   openRow: null,
+  editTeam: null,
 };
 
 const STAT_LABELS = {
@@ -41,6 +42,13 @@ const ago = (ms) => {
   if (s < 3600) return `${Math.round(s / 60)} min ago`;
   return new Date(ms).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' });
 };
+const shortAgo = (ms) => {
+  if (!ms) return 'Not yet';
+  const s = (Date.now() - ms) / 1000;
+  if (s < 60) return 'Just now';
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  return new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+};
 function toast(msg, kind = '') {
   const t = document.getElementById('toast');
   t.textContent = msg;
@@ -73,6 +81,21 @@ async function loadMe() {
   if (state.me) link.href = `#team/${state.me.id}`;
 }
 
+const ICONS = {
+  users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>',
+  blade: '<path d="M4 3h16M6 3v18M18 3v18M3 21h18"/><path d="M8 6h8l-8 5z"/>',
+  play: '<circle cx="12" cy="12" r="9"/><path d="M10 8.5l5 3.5-5 3.5z"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  chart: '<path d="M3 3v18h18"/><path d="M7 15l4-4 3 3 5-6"/>',
+  target: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/>',
+  trophy: '<path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0z"/><path d="M17 5h3v2a3 3 0 0 1-3 3M7 5H4v2a3 3 0 0 0 3 3"/>',
+  wallet: '<rect x="2" y="6" width="20" height="13" rx="2"/><path d="M2 10h20M16 15h2"/>',
+  list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
+};
+const tiles = (items, cls = '') => `<div class="stat-tiles ${cls}">${items.map((t) => `
+  <div class="stat-card"><div class="stat-icon ${t.color}"><svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[t.icon]}</svg></div>
+  <div><div class="stat-value">${t.value}</div><div class="stat-label">${t.label}</div></div></div>`).join('')}</div>`;
+
 // ------------------------------------------------------------ router
 async function router() {
   clearInterval(state.timer);
@@ -85,7 +108,7 @@ async function router() {
     if (!state.me) toast('That team link is not valid. Ask the commissioner for a new one.', 'error');
     return;
   }
-  document.querySelectorAll('.nav a').forEach((a) => {
+  document.querySelectorAll('.top-nav a').forEach((a) => {
     const current = a.dataset.view === view || (a.dataset.view === 'mine' && view === 'team' && state.me && Number(arg) === state.me.id);
     if (current) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   });
@@ -131,13 +154,18 @@ async function renderLive() {
     </a></li>`;
 
   $app.innerHTML = `
-    <section class="masthead">
-      <h1 class="week">Week ${d.week}</h1>
-      <p class="status">${status}</p>
-      <p class="muted">${n} teams alive, ${d.eliminated_count} cut. Stats updated ${ago(d.stats_updated)}.</p>
+    <section class="hero">
+      <h1>Week ${d.week} <em>Chopping Block</em></h1>
+      <p>${status}</p>
     </section>
+    ${tiles([
+      { icon: 'users', color: 'blue', value: n, label: 'Teams alive' },
+      { icon: 'blade', color: 'red', value: d.eliminated_count, label: 'Teams cut' },
+      { icon: 'play', color: 'green', value: `${final}/${d.games.length}`, label: live ? `Games final, ${live} live now` : 'Games final' },
+      { icon: 'clock', color: 'gold', value: shortAgo(d.stats_updated), label: 'Stats updated' },
+    ])}
     ${d.champion ? `<div class="champion">${esc(d.champion.name)} survived the season. Champion: ${esc(d.champion.owner)}.</div>` : ''}
-    ${n ? `<ol class="block-list" aria-label="Teams ranked by projected score">
+    ${n ? `<div class="block-card"><ol class="block-list" aria-label="Teams ranked by projected score">
       ${safe.map((t, i) => row(t, i + 1, 'safe')).join('')}
       ${doomed.length ? `<li class="blade" role="separator" aria-label="Cut line">
         <span class="blade-steel" aria-hidden="true"></span>
@@ -145,7 +173,7 @@ async function renderLive() {
         <span class="blade-gap">${gap != null ? `${pts(gap)} ${live || pre ? 'projected ' : ''}points from safety` : ''}</span></span>
       </li>` : ''}
       ${doomed.map((t, i) => row(t, safe.length + i + 1, 'doomed')).join('')}
-    </ol>` : `<div class="panel"><h3>No teams yet</h3><p>The commissioner can import owners and rosters from the Commissioner page.</p></div>`}
+    </ol></div>` : `<div class="panel"><h3>No teams yet</h3><p>The commissioner can import owners and rosters from the Commissioner page.</p></div>`}
     <h2>NFL this week</h2>
     <div class="game-grid">${d.games.map((g) => `
       <div class="game ${g.state}">
@@ -193,17 +221,17 @@ async function renderTeam(id) {
   const rosterCount = d.starters.length + d.bench.length;
 
   $app.innerHTML = `
-    <section class="team-head">
+    <section class="hero">
       <h1>${esc(t.name)}</h1>
-      <div class="facts">
-        <span>${esc(t.owner)}</span>
-        ${t.eliminated_week ? `<span class="badge cut">Cut in week ${t.eliminated_week}</span>` : '<span class="badge alive">Alive</span>'}
-        <span>Week ${d.week}: <b class="num">${pts(t.points)}</b> (proj <span class="num">${pts(t.projected)}</span>)</span>
-        <span>Season: <b class="num">${pts(t.season_total)}</b></span>
-        <span>FAAB: <b class="num">$${t.faab}</b></span>
-        <span>Roster: <b class="num">${rosterCount}/${d.roster_max}</b></span>
-      </div>
+      <p>${esc(t.owner)} ${t.eliminated_week ? `<span class="badge cut">Cut in week ${t.eliminated_week}</span>` : '<span class="badge alive">Alive</span>'}</p>
     </section>
+    ${tiles([
+      { icon: 'chart', color: 'blue', value: pts(t.points), label: `Week ${d.week} points` },
+      { icon: 'target', color: 'green', value: pts(t.projected), label: 'Projected' },
+      { icon: 'trophy', color: 'gold', value: pts(t.season_total), label: 'Season total' },
+      { icon: 'wallet', color: 'navy', value: `$${t.faab}`, label: 'FAAB left' },
+      { icon: 'list', color: 'red', value: `${rosterCount}/${d.roster_max}`, label: 'Roster spots' },
+    ], 'five')}
     ${t.eliminated_week ? '' : `
     <h2>Starters</h2>
     <div class="table-wrap"><table>${head}<tbody>${starterRows.join('')}</tbody></table></div>
@@ -265,13 +293,13 @@ async function renderPlayers() {
   };
 
   $app.innerHTML = `
-    <section class="team-head"><h1>Players</h1>
-      <p class="muted">${canAct ? 'Players released by cut teams and recent drops are on waivers until Wednesday. Bids are blind and the highest one wins.' : 'Open your team link to add players and place bids.'}</p>
+    <section class="hero"><h1>Find <em>Players</em></h1>
+      <p>${canAct ? 'Players released by cut teams and recent drops are on waivers until Wednesday. Bids are blind and the highest one wins.' : 'Open your team link to add players and place bids.'}</p>
     </section>
-    <div class="toolbar">
+    <div class="toolbar center">
       <input type="search" id="q" placeholder="Search by name" value="${esc(f.q)}" aria-label="Search players">
       <div class="seg" role="group" aria-label="Position">${['', 'QB', 'RB', 'WR', 'TE', 'K', 'DEF'].map((p) => `<button data-pos="${p}" aria-pressed="${f.pos === p}">${p || 'All'}</button>`).join('')}</div>
-      <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="all" ${f.all ? 'checked' : ''}> Include rostered</label>
+      <label class="check"><input type="checkbox" id="all" ${f.all ? 'checked' : ''}> Include rostered</label>
     </div>
     <div class="table-wrap"><table>
       <thead><tr><th>Player</th><th class="hide-sm">Game</th><th>Status</th><th class="r">Wk ${d.week}</th><th class="r">Proj</th><th></th></tr></thead>
@@ -328,7 +356,7 @@ async function showPlayer(id) {
 // ------------------------------------------------------------ graveyard / activity
 async function renderGraveyard() {
   const d = await api('/api/graveyard');
-  $app.innerHTML = `<section class="team-head"><h1>Graveyard</h1><p class="muted">Every team that lost its head, most recent first.</p></section>
+  $app.innerHTML = `<section class="hero"><h1>The <em>Graveyard</em></h1><p>Every team that lost its head, most recent first.</p></section>
     ${d.teams.length ? `<div class="panel"><ul class="list grave">${d.teams.map((t) => `
       <li><span class="gw">Week ${t.eliminated_week}</span><span style="flex:1"><a href="#team/${t.id}" class="gname">${esc(t.name)}</a> <span class="muted">${esc(t.owner)}</span></span><span class="num">${t.points != null ? pts(t.points) : ''}</span></li>`).join('')}</ul></div>`
     : '<div class="panel"><p>Nobody has been cut yet. The first cut happens after the current week goes final.</p></div>'}`;
@@ -337,7 +365,7 @@ async function renderGraveyard() {
 async function renderActivity() {
   const d = await api('/api/activity');
   const label = { add: 'Added', drop: 'Dropped', waiver: 'Won on waivers', eliminated: 'Cut', import: 'League import' };
-  $app.innerHTML = `<section class="team-head"><h1>Activity</h1></section>
+  $app.innerHTML = `<section class="hero"><h1>League <em>Activity</em></h1><p>Adds, drops, waiver wins and cuts.</p></section>
     ${d.items.length ? `<div class="panel"><ul class="list">${d.items.map((x) => `
       <li><span><b>${esc(x.team || 'League')}</b> ${esc(label[x.type] || x.type)} ${x.player ? `<b>${esc(x.player)}</b> <span class="muted">${esc(x.pos || '')}</span>` : ''} ${x.detail ? `<span class="muted">${esc(x.detail)}</span>` : ''}</span>
       <span class="muted" style="white-space:nowrap">${new Date(`${x.created_at.replace(' ', 'T')}Z`).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</span></li>`).join('')}</ul></div>`
@@ -365,8 +393,8 @@ async function renderAdmin() {
   const s = d.settings;
   const link = (t) => `${location.origin}/#join/${t.token}`;
   $app.innerHTML = `
-    <section class="team-head"><h1>Commissioner</h1>
-      <p class="muted">Season ${s.season}, week ${s.current_week}. ${d.player_count} NFL players loaded. ${d.pending_claims} pending bids.
+    <section class="hero"><h1>Commissioner <em>Tools</em></h1>
+      <p>Season ${s.season}, week ${s.current_week}. ${d.player_count} NFL players loaded. ${d.pending_claims} pending bids.
       Synced: players ${ago(d.synced.players)}, games ${ago(d.synced.games)}, stats ${ago(d.synced.stats)}.</p></section>
 
     <div class="panel"><h3>Weekly operations</h3>
@@ -376,7 +404,7 @@ async function renderAdmin() {
         <button class="btn" data-op="players">Sync NFL player list</button>
         <button class="btn" data-op="waivers">Process waivers now</button>
         <button class="btn danger" data-op="finalize">Finalize week ${s.current_week} and cut</button>
-        <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="force"> Cut even if games aren't final</label>
+        <label class="check"><input type="checkbox" id="force"> Cut even if games aren't final</label>
       </div>
       <div id="op-result"></div>
     </div>
@@ -386,7 +414,7 @@ async function renderAdmin() {
       <textarea id="csv" rows="8" placeholder="team,owner,email,player,pos,nfl_team,slot&#10;Heads Will Roll,Brad,brad@example.com,Josh Allen,QB,BUF,QB"></textarea>
       <div class="toolbar">
         <label class="btn" style="display:inline-flex">Load CSV file<input type="file" id="csv-file" accept=".csv,text/csv" hidden></label>
-        <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="replace"> Replace all existing teams</label>
+        <label class="check"><input type="checkbox" id="replace"> Replace all existing teams</label>
         <button class="btn primary" id="do-import">Import</button>
       </div>
       <div id="import-result"></div>
@@ -397,7 +425,19 @@ async function renderAdmin() {
       <div class="table-wrap"><table><thead><tr><th>Team</th><th>Owner</th><th class="r">FAAB</th><th class="r">Roster</th><th>Status</th><th></th></tr></thead><tbody>
       ${d.teams.map((t) => `<tr><td><a href="#team/${t.id}">${esc(t.name)}</a></td><td>${esc(t.owner)}<div class="pmeta">${esc(t.email || '')}</div></td>
         <td class="r">$${t.faab}</td><td class="r">${t.roster_size}</td><td>${t.eliminated_week ? `Cut wk ${t.eliminated_week}` : 'Alive'}</td>
-        <td class="r" style="white-space:nowrap"><button class="btn sm" data-copy="${esc(link(t))}">Copy link</button> <button class="btn sm" data-regen="${t.id}">New link</button></td></tr>`).join('') || '<tr><td colspan="6" class="muted">No teams yet. Import a CSV above.</td></tr>'}
+        <td class="r" style="white-space:nowrap"><button class="btn sm" data-edit="${t.id}">Edit</button> <button class="btn sm" data-copy="${esc(link(t))}">Copy link</button> <button class="btn sm" data-regen="${t.id}">New link</button></td></tr>
+        ${state.editTeam === t.id ? `<tr class="edit-row"><td colspan="6">
+          <div class="edit-grid">
+            <label>Team name<input id="ed-name" value="${esc(t.name)}"></label>
+            <label>Owner<input id="ed-owner" value="${esc(t.owner)}"></label>
+            <label>Email<input id="ed-email" type="email" value="${esc(t.email || '')}"></label>
+            <label>FAAB<input id="ed-faab" type="number" min="0" step="1" value="${t.faab}"></label>
+          </div>
+          <div class="toolbar">
+            <button class="btn primary sm" data-save-team="${t.id}">Save team</button>
+            <button class="btn sm" data-cancel-edit>Cancel</button>
+          </div>
+        </td></tr>` : ''}`).join('') || '<tr><td colspan="6" class="muted">No teams yet. Import a CSV above.</td></tr>'}
       </tbody></table></div>
     </div>
 
@@ -453,6 +493,23 @@ async function renderAdmin() {
     } catch (e) { res.innerHTML = `<p style="color:var(--blood)">${esc(e.message)}</p>`; }
   });
 
+  $app.querySelectorAll('[data-edit]').forEach((b) => b.addEventListener('click', () => {
+    state.editTeam = Number(b.dataset.edit);
+    renderAdmin().then(() => document.getElementById('ed-name')?.focus());
+  }));
+  $app.querySelector('[data-cancel-edit]')?.addEventListener('click', () => { state.editTeam = null; renderAdmin(); });
+  $app.querySelector('[data-save-team]')?.addEventListener('click', async (e) => {
+    const body = {
+      name: document.getElementById('ed-name').value,
+      owner: document.getElementById('ed-owner').value,
+      email: document.getElementById('ed-email').value.trim(),
+      faab: Number(document.getElementById('ed-faab').value),
+    };
+    if (await act(() => api(`/api/admin/teams/${e.currentTarget.dataset.saveTeam}`, { method: 'PUT', admin: true, body }), 'Team saved')) {
+      state.editTeam = null;
+      renderAdmin();
+    }
+  });
   $app.querySelectorAll('[data-copy]').forEach((b) => b.addEventListener('click', async () => {
     try { await navigator.clipboard.writeText(b.dataset.copy); toast('Link copied'); } catch { prompt('Copy this link', b.dataset.copy); }
   }));
@@ -473,7 +530,7 @@ async function renderAdmin() {
 }
 
 function adminLogin(msg = '') {
-  $app.innerHTML = `<section class="team-head"><h1>Commissioner</h1></section>
+  $app.innerHTML = `<section class="hero"><h1>Commissioner <em>Tools</em></h1></section>
     <div class="panel"><form id="admin-login" class="inline-form">
       <label>Commissioner key<input type="password" id="admin-key" autocomplete="current-password" required></label>
       <button class="btn primary">Sign in</button></form>

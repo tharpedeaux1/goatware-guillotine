@@ -7,23 +7,25 @@
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🪓</text></svg>">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Barlow:wght@400;500;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <a class="skip" href="#app">Skip to content</a>
-  <header class="topbar">
-    <a class="brand" href="#live" aria-label="Chopping block">
-      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><path d="M4 3h24v4H4z"/><path class="edge" d="M6 9h20l-20 9z"/><path d="M4 26h24v3H4zM7 7h2v19H7zM23 7h2v19h-2z"/></svg>
-      <span id="league-name">Guillotine League</span>
-    </a>
-    <nav class="nav" aria-label="Main">
-      <a href="#live" data-view="live">Chopping block</a>
-      <a href="#players" data-view="players">Players</a>
-      <a href="#graveyard" data-view="graveyard">Graveyard</a>
-      <a href="#activity" data-view="activity">Activity</a>
-      <a href="#" data-view="mine" id="my-team-link" hidden>My team</a>
-    </nav>
+  <header class="site">
+    <div class="header-inner">
+      <a class="logo-mark" href="#live" aria-label="Chopping block">
+        <svg viewBox="0 0 32 32" aria-hidden="true"><path class="lm-frame" d="M4 3h24v4H4zM4 26h24v3H4zM7 7h2.5v19H7zM22.5 7H25v19h-2.5z"/><path class="lm-blade" d="M9.5 9h13L9.5 17z"/></svg>
+        <span id="league-name">Guillotine League</span>
+      </a>
+      <nav class="top-nav" aria-label="Main">
+        <a href="#live" data-view="live">Chopping Block</a>
+        <a href="#players" data-view="players">Players</a>
+        <a href="#graveyard" data-view="graveyard">Graveyard</a>
+        <a href="#activity" data-view="activity">Activity</a>
+        <a href="#" data-view="mine" id="my-team-link" hidden>My Team</a>
+      </nav>
+    </div>
   </header>
 
   <main id="app" tabindex="-1"></main>

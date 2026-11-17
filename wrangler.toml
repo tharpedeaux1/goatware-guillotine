@@ -1,0 +1,26 @@
+name = "guillotine-league"
+main = "src/index.js"
+compatibility_date = "2025-10-01"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "guillotine"
+database_id = "df1fa949-c5c5-4a6d-a59e-6590df15a95d"
+migrations_dir = "migrations"
+
+# One trigger keeps this within the free plan (5 cron triggers per account).
+# Every 2 minutes the Worker syncs live data and, when due, runs one scheduled job (all times UTC):
+#   live stats while games are on, projections every 6 hours
+#   one position of the NFL player list per run, each about once a day
+#   Tuesday from 10:00: the weekly cut, once every game is final
+#   Wednesday from 16:00: FAAB waivers
+[triggers]
+crons = ["*/2 * * * *"]
+
+[observability]
+enabled = true

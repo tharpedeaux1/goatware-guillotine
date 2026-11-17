@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Guillotine League</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🪓</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Barlow:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip" href="#app">Skip to content</a>
+  <header class="topbar">
+    <a class="brand" href="#live" aria-label="Chopping block">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><path d="M4 3h24v4H4z"/><path class="edge" d="M6 9h20l-20 9z"/><path d="M4 26h24v3H4zM7 7h2v19H7zM23 7h2v19h-2z"/></svg>
+      <span id="league-name">Guillotine League</span>
+    </a>
+    <nav class="nav" aria-label="Main">
+      <a href="#live" data-view="live">Chopping block</a>
+      <a href="#players" data-view="players">Players</a>
+      <a href="#graveyard" data-view="graveyard">Graveyard</a>
+      <a href="#activity" data-view="activity">Activity</a>
+      <a href="#" data-view="mine" id="my-team-link" hidden>My team</a>
+    </nav>
+  </header>
+
+  <main id="app" tabindex="-1"></main>
+
+  <footer class="foot">
+    <span>Live stats via Sleeper and ESPN. Refreshes every 30 seconds during games.</span>
+    <a href="#admin">Commissioner</a>
+  </footer>
+
+  <dialog id="player-dialog" aria-labelledby="pd-title">
+    <div id="player-dialog-body"></div>
+    <form method="dialog"><button class="btn">Close</button></form>
+  </dialog>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

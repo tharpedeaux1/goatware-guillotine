@@ -866,8 +866,16 @@ async function adminUpdateTeam(env, id, body) {
   const email = body.email ?? t.email;
   const faab = body.faab != null ? Number(body.faab) : t.faab;
   const elim = 'eliminated_week' in body ? (body.eliminated_week ? Number(body.eliminated_week) : null) : t.eliminated_week;
-  await env.DB.prepare('UPDATE teams SET name = ?, owner = ?, email = ?, faab = ?, eliminated_week = ? WHERE id = ?')
-    .bind(name, owner, email, faab, elim, id).run();
+  if (!String(name).trim()) throw new HttpError(400, 'Team name can\'t be blank.');
+  if (!Number.isInteger(faab) || faab < 0) throw new HttpError(400, 'FAAB must be a whole number, $0 or more.');
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new HttpError(400, `"${email}" doesn't look like an email address.`);
+  try {
+    await env.DB.prepare('UPDATE teams SET name = ?, owner = ?, email = ?, faab = ?, eliminated_week = ? WHERE id = ?')
+      .bind(String(name).trim(), String(owner || '').trim(), email ? String(email).trim() : null, faab, elim, id).run();
+  } catch (e) {
+    if (String(e.message).includes('UNIQUE')) throw new HttpError(409, `Another team is already named "${name}".`);
+    throw e;
+  }
   return { ok: true };
 }
 

@@ -504,7 +504,7 @@ async function renderGraveyard() {
 
 async function renderActivity() {
   const d = await api('/api/activity');
-  const label = { add: 'Added', drop: 'Dropped', waiver: 'Won on waivers', eliminated: 'Cut', import: 'League import' };
+  const label = { add: 'Added', drop: 'Dropped', waiver: 'Won on waivers', eliminated: 'Cut', import: 'League import', lineup: 'Lineup change:' };
   $app.innerHTML = `<section class="hero"><h1>League <em>Activity</em></h1><p>Adds, drops, waiver wins and cuts.</p></section>
     ${d.items.length ? `<div class="panel"><ul class="list">${d.items.map((x) => `
       <li><span><b>${esc(x.team || 'League')}</b> ${esc(label[x.type] || x.type)} ${x.player ? `<b>${esc(x.player)}</b> <span class="muted">${esc(x.pos || '')}</span>` : ''} ${x.detail ? `<span class="muted">${esc(x.detail)}</span>` : ''}</span>
@@ -756,6 +756,7 @@ async function loadAdminRoster(teamId) {
   if (!box) return;
   const d = await api(`/api/teams/${teamId}`);
   const players = [...d.starters, ...d.bench];
+  const slotNames = Object.keys(d.slots).filter((k) => k === 'BN' || Number(d.slots[k]) > 0);
   box.innerHTML = `
     <h3>Roster <span class="muted" style="font-weight:500">${players.filter((p) => p.slot !== 'IR').length}/${d.roster_max} active${d.ir_max ? `, ${players.filter((p) => p.slot === 'IR').length}/${d.ir_max} IR` : ''}</span></h3>
     <div class="adm-roster-grid">
@@ -763,8 +764,12 @@ async function loadAdminRoster(teamId) {
         <label class="check" style="margin-bottom:6px">Removed players go to
           <select id="rm-to"><option value="waivers">Waivers</option><option value="free_agents">Free agency</option></select></label>
         <ul class="list adm-list">${players.map((p) => `<li>
-          <span><b>${esc(p.name)}</b> <span class="pmeta">${esc(p.pos)} ${esc(p.nfl || 'FA')}, ${esc(p.slot)}</span></span>
-          <button class="btn sm danger" data-rm="${esc(p.id)}" data-name="${esc(p.name)}">Remove</button></li>`).join('') || '<li class="muted">No players on this roster.</li>'}</ul>
+          <span><b>${esc(p.name)}</b>${p.injury ? `<span class="inj">${esc(p.injury)}</span>` : ''} <span class="pmeta">${esc(p.pos)} ${esc(p.nfl || 'FA')}</span></span>
+          <span style="display:flex;gap:6px;align-items:center">
+            <select data-adm-slot="${esc(p.id)}" data-name="${esc(p.name)}" aria-label="Slot for ${esc(p.name)}">${slotNames.map((k) => `<option ${k === p.slot ? 'selected' : ''}>${k}</option>`).join('')}</select>
+            <button class="btn sm danger" data-rm="${esc(p.id)}" data-name="${esc(p.name)}">Remove</button>
+          </span></li>`).join('') || '<li class="muted">No players on this roster.</li>'}</ul>
+        <p class="pmeta" style="margin-top:6px">Changing a slot here is a commissioner override. It skips game locks, position rules and IR eligibility.</p>
       </div>
       <div>
         <label>Add a player<input type="search" id="adm-q" placeholder="Search any NFL player" autocomplete="off"></label>
@@ -772,6 +777,11 @@ async function loadAdminRoster(teamId) {
       </div>
     </div>`;
 
+  box.querySelectorAll('[data-adm-slot]').forEach((sel) => sel.addEventListener('change', async () => {
+    const ok = await act(() => api(`/api/admin/teams/${teamId}/slot`, { method: 'POST', admin: true, body: { player_id: sel.dataset.admSlot, slot: sel.value } }), `${sel.dataset.name} moved to ${sel.value}`);
+    loadAdminRoster(teamId).catch(() => {});
+    if (!ok) return;
+  }));
   box.querySelectorAll('[data-rm]').forEach((b) => b.addEventListener('click', async () => {
     const to = document.getElementById('rm-to').value;
     if (!confirm(`Remove ${b.dataset.name} from ${d.team.name}? He goes to ${to === 'waivers' ? 'waivers' : 'free agency'}.`)) return;

@@ -366,7 +366,7 @@ async function renderTeam(id) {
     <div class="table-wrap"><table>${head}<tbody>${benchPlayers.map((p) => prow(p, 'BN')).join('') || `<tr><td colspan="7" class="muted">No bench players.</td></tr>`}</tbody></table></div>
     ${d.ir_max ? `<h2>Injured reserve <span class="muted" style="font-size:13px;font-weight:500">Doesn't count toward the ${d.roster_max}. For players listed ${esc(d.ir_statuses.join(', '))}.</span></h2>
     <div class="table-wrap"><table>${head}<tbody>${irPlayers.map((p) => prow(p, 'IR')).join('')}${Array.from({ length: Math.max(0, d.ir_max - irPlayers.length) }, () => `<tr><td class="slot">IR</td><td class="empty-slot" colspan="${own ? 6 : 4}">Empty</td></tr>`).join('')}</tbody></table></div>` : ''}
-    ${own ? `<div class="toolbar"><button class="btn primary" id="save-lineup">Save lineup</button><a class="btn" href="#players">Find players</a></div>` : ''}`}
+    ${own ? `<div class="toolbar"><span class="muted" style="font-size:12.5px">Lineup changes save automatically. Moving a player into a full spot sends the player there to the bench.</span><a class="btn" href="#players">Find players</a></div>` : ''}`}
     ${d.history.length ? `<h2>Weekly results</h2><div class="panel"><ul class="list">${d.history.map((h) => `
       <li><span>Week ${lw(h.week)}${h.eliminated ? ' <span class="badge cut">Cut</span>' : ''}</span><span class="num">${pts(h.points)} <span class="muted">rank ${h.rank}</span></span></li>`).join('')}</ul></div>` : ''}
     ${d.is_owner ? '' : (state.me ? '' : `<p class="muted" style="margin-top:24px">Managing this team? Open the private link the commissioner sent you.</p>`)}`;
@@ -388,12 +388,48 @@ async function renderTeam(id) {
     if (await act(() => api('/api/me/logo', { method: 'DELETE' }), 'Logo removed')) { renderTeam(id); heartbeat(); }
   });
   if (!own) return;
-  $app.querySelectorAll('select[data-slot]').forEach((s) => s.addEventListener('change', () => { state.dirty = true; }));
-  document.getElementById('save-lineup')?.addEventListener('click', async () => {
-    const slots = {};
-    $app.querySelectorAll('select[data-slot]').forEach((s) => { slots[s.dataset.slot] = s.value; });
-    if (await act(() => api('/api/me/lineup', { method: 'POST', body: { slots } }), 'Lineup saved')) { state.dirty = false; renderTeam(id); }
+  // Moving a player into a full spot sends the player there to the bench. When the spot has room for
+  // more than one (like WR/TE), the owner picks who goes to the bench. Each change saves right away.
+  const all = [...d.starters, ...d.bench];
+  const byPid = Object.fromEntries(all.map((p) => [p.id, p]));
+  const current = Object.fromEntries(all.map((p) => [p.id, Number(d.slots[p.slot]) > 0 ? p.slot : 'BN']));
+  const pickOut = (to, choices) => new Promise((resolve) => {
+    const dlg = document.createElement('dialog');
+    dlg.className = 'swap-dialog';
+    dlg.innerHTML = `<h3>Every ${esc(to)} spot is full</h3><p class="muted">Who should go to the bench?</p>
+      <div class="swap-choices">${choices.map((p) => `<button class="btn" data-pick="${esc(p.id)}">${esc(p.name)} <span class="pmeta">${esc(p.pos)} ${esc(p.nfl || '')}, proj ${pts(p.proj)}</span></button>`).join('')}</div>
+      <div class="toolbar"><button class="btn sm" data-pick="">Cancel</button></div>`;
+    document.body.appendChild(dlg);
+    dlg.querySelectorAll('[data-pick]').forEach((b) => b.addEventListener('click', () => { dlg.close(); resolve(b.dataset.pick || null); }));
+    dlg.addEventListener('close', () => { dlg.remove(); resolve(null); });
+    dlg.showModal();
   });
+  $app.querySelectorAll('select[data-slot]').forEach((sel) => sel.addEventListener('change', async () => {
+    const mover = byPid[sel.dataset.slot];
+    const from = current[mover.id];
+    const to = sel.value;
+    const moves = { [mover.id]: to };
+    let note = '';
+    if (to !== 'BN') {
+      const occupants = all.filter((p) => p.id !== mover.id && current[p.id] === to);
+      if (occupants.length >= Number(d.slots[to])) {
+        const open = occupants.filter((p) => !p.locked);
+        if (!open.length) { toast(`Every ${to} spot is held by a player whose game has started.`, 'error'); sel.value = from; return; }
+        state.dirty = true;
+        const outId = open.length === 1 ? open[0].id : await pickOut(to, open);
+        if (!outId) { state.dirty = false; sel.value = from; return; }
+        moves[outId] = 'BN';
+        note = `${byPid[outId].name} moved to the bench`;
+      }
+    }
+    const slots = { ...current, ...moves };
+    state.dirty = true;
+    $app.querySelectorAll('select[data-slot]').forEach((x) => { x.disabled = true; });
+    const ok = await act(() => api('/api/me/lineup', { method: 'POST', body: { slots } }), note ? `Saved. ${note}.` : 'Lineup saved');
+    state.dirty = false;
+    renderTeam(id);
+    if (!ok) sel.value = from;
+  }));
   $app.querySelectorAll('[data-drop]').forEach((b) => b.addEventListener('click', async () => {
     if (!confirm(`Drop ${b.dataset.name}? He goes to waivers.`)) return;
     if (await act(() => api('/api/me/drop', { method: 'POST', body: { player_id: b.dataset.drop } }), `${b.dataset.name} dropped`)) renderTeam(id);

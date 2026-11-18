@@ -72,8 +72,18 @@ main { width: 100%; max-width: 1180px; margin: 0 auto; padding: 0 28px 40px; fle
 .foot a:hover { color: var(--wf-blue); }
 
 /* ---------- banner (SalesIQ hero-illustration treatment) ---------- */
-.banner { display: block; width: 100%; height: auto; margin: 18px auto 0; border-radius: var(--radius); box-shadow: 0 12px 30px rgba(0,30,45,0.12); }
-@media (max-width: 600px) { .banner { margin-top: 12px; border-radius: 12px; } }
+.banner-wrap {
+  position: relative; overflow: hidden; margin: 18px auto 0; border-radius: var(--radius);
+  aspect-ratio: 2172 / 362; box-shadow: 0 12px 30px rgba(0,30,45,0.12); background: #0B2A38;
+}
+/* Half-height strip: the full banner sits centered at half size over a blurred copy that fills the width. */
+.banner-bg { position: absolute; inset: -20px; width: calc(100% + 40px); height: calc(100% + 40px); object-fit: cover; filter: blur(16px) saturate(1.1); opacity: .85; }
+.banner { position: relative; display: block; height: 100%; width: auto; margin: 0 auto; }
+@media (max-width: 700px) {
+  .banner-wrap { aspect-ratio: auto; margin-top: 12px; border-radius: 12px; }
+  .banner-bg { display: none; }
+  .banner { width: 100%; height: auto; }
+}
 
 /* ---------- page hero (SalesIQ: centered, two-tone title) ---------- */
 .hero { text-align: center; padding: 22px 0 6px; }
@@ -113,7 +123,7 @@ p { margin: 0 0 10px; }
 .block-card { background: var(--wf-card); border: 1px solid var(--wf-line); border-radius: var(--radius); padding: 8px; }
 .block-list { list-style: none; margin: 0; padding: 0; }
 .row a {
-  display: grid; grid-template-columns: 34px minmax(0, 1fr) auto auto; align-items: center; gap: 14px;
+  display: grid; grid-template-columns: 30px 40px minmax(0, 1fr) auto auto; align-items: center; gap: 14px;
   padding: 11px 14px; text-decoration: none; color: inherit; border-radius: 11px;
 }
 .row + .row a { border-top: 1px solid var(--wf-line); }
@@ -223,6 +233,11 @@ label { display: grid; gap: 4px; font-weight: 600; font-size: 12px; color: var(-
 .edit-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
 @media (max-width: 760px) { .edit-grid { grid-template-columns: 1fr 1fr; } }
 .edit-grid input, .edit-grid select { width: 100%; }
+.adm-roster { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--wf-line); }
+.adm-roster-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+@media (max-width: 760px) { .adm-roster-grid { grid-template-columns: 1fr; } }
+.adm-list li, .adm-results li { align-items: center; padding: 7px 0; }
+.adm-roster input[type="search"] { width: 100%; }
 .cut-box { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--wf-line); }
 .cut-box h3 { color: var(--wf-red); }
 
@@ -244,7 +259,8 @@ dialog form { margin-top: 16px; text-align: right; }
 
 @media (max-width: 600px) {
   main { padding: 0 16px 32px; }
-  .row a { grid-template-columns: 24px minmax(0, 1fr) auto; gap: 10px; }
+  .row a { grid-template-columns: 22px 34px minmax(0, 1fr) auto; gap: 10px; }
+  .row .tlogo { width: 34px; height: 34px; }
   .pips { display: none; }
   .score b { font-size: 19px; }
   .hide-sm { display: none; }
@@ -284,3 +300,17 @@ dialog form { margin-top: 16px; text-align: right; }
 .online-chip .live-dot { width: 6px; height: 6px; box-shadow: none; }
 .pl-short { display: none; }
 @media (max-width: 860px) { .pl-long { display: none; } .pl-short { display: inline; } .presence-pop { width: min(290px, 88vw); } }
+
+/* ---------- team logos ---------- */
+.tlogo {
+  width: 40px; height: 40px; border-radius: 11px; object-fit: cover; flex: 0 0 auto; background: #fff;
+  border: 1px solid var(--wf-line); display: inline-flex; align-items: center; justify-content: center;
+  font: 700 13px 'Poppins', sans-serif; color: #fff;
+}
+.tlogo-fallback { border-color: transparent; }
+.tlogo.sm { width: 28px; height: 28px; border-radius: 8px; font-size: 10.5px; }
+.tlogo.xl { width: 104px; height: 104px; border-radius: 24px; font-size: 34px; box-shadow: 0 12px 30px rgba(0,30,45,0.12); }
+.hero-logo { display: flex; justify-content: center; margin-bottom: 10px; }
+.logo-tools { margin: 0 0 12px; }
+.grave .tlogo { filter: grayscale(1); opacity: .75; }
+img.avatar { object-fit: cover; background: #fff; }

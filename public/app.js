@@ -110,7 +110,46 @@ const VID = (() => {
 const PAGE_LABEL = { live: 'Watching the Chopping Block', team: 'Looking at a team', players: 'Browsing players', graveyard: 'Visiting the Graveyard', activity: 'Reading Activity' };
 const AVATAR_COLORS = ['#007CBC', '#5FA845', '#E8536A', '#9A6A12', '#4E8DF5', '#0B2A38', '#00618f', '#4c8637'];
 const initials = (o) => (o.owner || o.team || '?').split(/\s+/).map((w) => (w.match(/[a-z0-9]/i) || [''])[0]).filter(Boolean).slice(0, 2).join('').toUpperCase() || '?';
-const avatar = (o) => `<span class="avatar" style="background:${AVATAR_COLORS[o.team_id % AVATAR_COLORS.length]}" aria-hidden="true">${esc(initials(o))}</span>`;
+const avatar = (o) => (o.logo_v
+  ? `<img class="avatar" src="/api/logos/${o.team_id}?v=${o.logo_v}" alt="">`
+  : `<span class="avatar" style="background:${AVATAR_COLORS[o.team_id % AVATAR_COLORS.length]}" aria-hidden="true">${esc(initials(o))}</span>`);
+// Team logo, or a colored initials tile when there isn't one.
+const teamLogo = (id, v, name, size = '') => (v
+  ? `<img class="tlogo ${size}" src="/api/logos/${id}?v=${v}" alt="" loading="lazy">`
+  : `<span class="tlogo ${size} tlogo-fallback" style="background:${AVATAR_COLORS[id % AVATAR_COLORS.length]}" aria-hidden="true">${esc(initials({ team: name }))}</span>`);
+
+// Shrink an uploaded image to a 256px square (whole image kept, centered) before sending it.
+async function imageToLogo(file) {
+  if (!file || !file.type.startsWith('image/')) throw new Error('Choose an image file (PNG, JPG, WebP or SVG).');
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((res, rej) => {
+      const i = new Image();
+      i.onload = () => res(i);
+      i.onerror = () => rej(new Error("That image couldn't be read. Try a PNG or JPG."));
+      i.src = url;
+    });
+    const size = 256;
+    const draw = (bg) => {
+      const c = document.createElement('canvas');
+      c.width = c.height = size;
+      const g = c.getContext('2d');
+      if (bg) { g.fillStyle = bg; g.fillRect(0, 0, size, size); }
+      const w = img.naturalWidth || size;
+      const h = img.naturalHeight || size;
+      const k = Math.min(size / w, size / h);
+      g.imageSmoothingQuality = 'high';
+      g.drawImage(img, (size - w * k) / 2, (size - h * k) / 2, w * k, h * k);
+      return c;
+    };
+    let data = draw(null).toDataURL('image/webp', 0.86);
+    if (!data.startsWith('data:image/webp')) data = draw('#ffffff').toDataURL('image/jpeg', 0.88); // browsers without WebP encoding
+    return data;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 const isOnline = (teamId) => state.online.owners.some((o) => o.team_id === teamId);
 
 async function heartbeat() {
@@ -206,14 +245,18 @@ async function renderLive() {
   const row = (t, rank, cls) => `
     <li class="row ${cls} ${isOnline(t.id) ? 'is-online' : ''}" data-team-id="${t.id}"><a href="#team/${t.id}">
       <span class="rank">${rank}</span>
+      ${teamLogo(t.id, t.logo_v, t.name)}
       <span class="who"><span class="tname">${esc(t.name)}<i class="on-dot" title="Online now"></i></span><span class="owner">${esc(t.owner)}</span></span>
       <span class="pips" title="Starters: ${t.pips.filter((p) => p === 'pre').length} to play, ${t.pips.filter((p) => p === 'in').length} playing, ${t.pips.filter((p) => p === 'post').length} done">${t.pips.map((p) => `<i class="pip ${p}"></i>`).join('')}</span>
       <span class="score"><b>${pts(t.points)}</b><small>${t.pips.some((x) => x === 'pre' || x === 'in') ? `proj ${pts(t.projected)}` : 'final'}</small></span>
     </a></li>`;
 
   $app.innerHTML = `
-    <img class="banner" src="/banner.jpg" srcset="/banner-1200.jpg 1200w, /banner.jpg 2172w" sizes="(max-width: 1180px) 100vw, 1124px"
-      width="2172" height="724" alt="Goatware: Fantasy football. Like a GOAT.">
+    <div class="banner-wrap">
+      <img class="banner-bg" src="/banner-1200.jpg" alt="" aria-hidden="true">
+      <img class="banner" src="/banner.jpg" srcset="/banner-1200.jpg 1200w, /banner.jpg 2172w" sizes="(max-width: 700px) 100vw, 562px"
+        width="2172" height="724" alt="Goatware: Fantasy football. Like a GOAT.">
+    </div>
     <section class="hero">
       <h1>Week ${lw(d.week)} <em>Chopping Block</em></h1>
       <p>${status}</p>
@@ -283,6 +326,11 @@ async function renderTeam(id) {
 
   $app.innerHTML = `
     <section class="hero">
+      <div class="hero-logo">${teamLogo(t.id, t.logo_v, t.name, 'xl')}</div>
+      ${d.is_owner ? `<div class="toolbar center logo-tools">
+        <label class="btn sm">${t.logo_v ? 'Change logo' : 'Add a team logo'}<input type="file" id="logo-file" accept="image/*" hidden></label>
+        ${t.logo_v ? '<button class="btn sm danger" id="logo-remove">Remove logo</button>' : ''}
+      </div>` : ''}
       <h1>${esc(t.name)}</h1>
       <p>${esc(t.owner)} ${isOnline(t.id) ? '<span class="online-chip"><span class="live-dot"></span>Online now</span>' : ''} ${t.eliminated_week ? `<span class="badge cut">Cut in week ${lw(t.eliminated_week)}</span>` : '<span class="badge alive">Alive</span>'}</p>
     </section>
@@ -309,6 +357,21 @@ async function renderTeam(id) {
     ${d.is_owner ? '' : (state.me ? '' : `<p class="muted" style="margin-top:24px">Managing this team? Open the private link the commissioner sent you.</p>`)}`;
 
   bindPlayerLinks();
+  document.getElementById('logo-file')?.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    state.dirty = true;
+    const ok = await act(async () => {
+      const data = await imageToLogo(file);
+      await api('/api/me/logo', { method: 'PUT', body: { data } });
+    }, 'Logo saved');
+    state.dirty = false;
+    if (ok) { renderTeam(id); heartbeat(); }
+  });
+  document.getElementById('logo-remove')?.addEventListener('click', async () => {
+    if (!confirm('Remove your team logo?')) return;
+    if (await act(() => api('/api/me/logo', { method: 'DELETE' }), 'Logo removed')) { renderTeam(id); heartbeat(); }
+  });
   if (!own) return;
   $app.querySelectorAll('select[data-slot]').forEach((s) => s.addEventListener('change', () => { state.dirty = true; }));
   document.getElementById('save-lineup')?.addEventListener('click', async () => {
@@ -421,7 +484,7 @@ async function renderGraveyard() {
   state.firstWeek = d.first_week || 1;
   $app.innerHTML = `<section class="hero"><h1>The <em>Graveyard</em></h1><p>Every team that lost its head, most recent first.</p></section>
     ${d.teams.length ? `<div class="panel"><ul class="list grave">${d.teams.map((t) => `
-      <li><span class="gw">Week ${lw(t.eliminated_week)}</span><span style="flex:1"><a href="#team/${t.id}" class="gname">${esc(t.name)}</a> <span class="muted">${esc(t.owner)}</span></span><span class="num">${t.points != null ? pts(t.points) : ''}</span></li>`).join('')}</ul></div>`
+      <li><span class="gw">Week ${lw(t.eliminated_week)}</span><span style="flex:1;display:flex;align-items:center;gap:10px">${teamLogo(t.id, t.logo_v, t.name, 'sm')}<span><a href="#team/${t.id}" class="gname">${esc(t.name)}</a> <span class="muted">${esc(t.owner)}</span></span></span><span class="num">${t.points != null ? pts(t.points) : ''}</span></li>`).join('')}</ul></div>`
     : '<div class="panel"><p>Nobody has been cut yet. The first cut happens after the current week goes final.</p></div>'}`;
 }
 
@@ -487,7 +550,7 @@ async function renderAdmin() {
     <div class="panel"><h3>Teams and owner links</h3>
       <p class="muted">Send each owner their private link. Anyone with it can manage that team.</p>
       <div class="table-wrap"><table><thead><tr><th>Team</th><th>Owner</th><th class="r">FAAB</th><th class="r">Roster</th><th>Status</th><th>Last seen</th><th></th></tr></thead><tbody>
-      ${d.teams.map((t) => `<tr><td><a href="#team/${t.id}">${esc(t.name)}</a></td><td>${esc(t.owner)}<div class="pmeta">${esc(t.email || '')}</div></td>
+      ${d.teams.map((t) => `<tr><td><span style="display:inline-flex;align-items:center;gap:8px">${teamLogo(t.id, t.logo_v, t.name, 'sm')}<a href="#team/${t.id}">${esc(t.name)}</a></span></td><td>${esc(t.owner)}<div class="pmeta">${esc(t.email || '')}</div></td>
         <td class="r">$${t.faab}</td><td class="r">${t.roster_size}</td><td>${t.eliminated_week ? `Cut wk ${lw(t.eliminated_week)}` : 'Alive'}</td>
         <td>${isOnline(t.id) ? '<span class="online-chip"><span class="live-dot"></span>Online</span>' : t.last_seen ? `<span class="muted">${ago(t.last_seen)}</span>` : '<span class="muted">Never</span>'}</td>
         <td class="r" style="white-space:nowrap"><button class="btn sm" data-edit="${t.id}">Edit</button> <button class="btn sm" data-copy="${esc(link(t))}">Copy link</button> <button class="btn sm" data-regen="${t.id}">New link</button></td></tr>
@@ -501,7 +564,9 @@ async function renderAdmin() {
           <div class="toolbar">
             <button class="btn primary sm" data-save-team="${t.id}">Save team</button>
             <button class="btn sm" data-cancel-edit>Cancel</button>
+            ${t.logo_v ? `<button class="btn sm danger" data-rm-logo="${t.id}">Remove team logo</button>` : ''}
           </div>
+          ${t.eliminated_week ? '' : '<div class="adm-roster" id="adm-roster"><p class="muted">Loading roster</p></div>'}
           ${t.eliminated_week ? '' : `<div class="cut-box">
             <h3>Cut this team</h3>
             <p class="muted">Moves the team to the Graveyard and releases its players to waivers, where owners can bid FAAB on them until waivers run. This can't be undone.</p>
@@ -584,6 +649,11 @@ async function renderAdmin() {
       renderAdmin();
     }
   });
+  $app.querySelector('[data-rm-logo]')?.addEventListener('click', async (e) => {
+    if (!confirm('Remove this team\'s logo?')) return;
+    if (await act(() => api(`/api/admin/teams/${e.currentTarget.dataset.rmLogo}/logo`, { method: 'DELETE', admin: true }), 'Logo removed')) renderAdmin();
+  });
+  if (state.editTeam && document.getElementById('adm-roster')) loadAdminRoster(state.editTeam).catch((err) => toast(err.message, 'error'));
   $app.querySelector('[data-cut]')?.addEventListener('click', async (e) => {
     const b = e.currentTarget;
     const leagueWeek = Number(document.getElementById('cut-week').value);
@@ -612,6 +682,59 @@ async function renderAdmin() {
     if (await act(() => api('/api/admin/reset', { method: 'POST', admin: true, body: { confirm: confirmText } }), 'League reset')) renderAdmin();
   });
   document.getElementById('sign-out').addEventListener('click', () => { state.adminKey = ''; localStorage.removeItem('gl_admin'); renderAdmin(); });
+}
+
+// Commissioner roster tools inside a team's Edit panel.
+async function loadAdminRoster(teamId) {
+  const box = document.getElementById('adm-roster');
+  if (!box) return;
+  const d = await api(`/api/teams/${teamId}`);
+  const players = [...d.starters, ...d.bench];
+  box.innerHTML = `
+    <h3>Roster <span class="muted" style="font-weight:500">${players.length}/${d.roster_max}</span></h3>
+    <div class="adm-roster-grid">
+      <div>
+        <label class="check" style="margin-bottom:6px">Removed players go to
+          <select id="rm-to"><option value="waivers">Waivers</option><option value="free_agents">Free agency</option></select></label>
+        <ul class="list adm-list">${players.map((p) => `<li>
+          <span><b>${esc(p.name)}</b> <span class="pmeta">${esc(p.pos)} ${esc(p.nfl || 'FA')}, ${esc(p.slot)}</span></span>
+          <button class="btn sm danger" data-rm="${esc(p.id)}" data-name="${esc(p.name)}">Remove</button></li>`).join('') || '<li class="muted">No players on this roster.</li>'}</ul>
+      </div>
+      <div>
+        <label>Add a player<input type="search" id="adm-q" placeholder="Search any NFL player" autocomplete="off"></label>
+        <ul class="list adm-results" id="adm-results"></ul>
+      </div>
+    </div>`;
+
+  box.querySelectorAll('[data-rm]').forEach((b) => b.addEventListener('click', async () => {
+    const to = document.getElementById('rm-to').value;
+    if (!confirm(`Remove ${b.dataset.name} from ${d.team.name}? He goes to ${to === 'waivers' ? 'waivers' : 'free agency'}.`)) return;
+    if (await act(() => api(`/api/admin/teams/${teamId}/players/${encodeURIComponent(b.dataset.rm)}?to=${to}`, { method: 'DELETE', admin: true }), `${b.dataset.name} removed`)) renderAdmin();
+  }));
+
+  let deb;
+  const q = document.getElementById('adm-q');
+  const results = document.getElementById('adm-results');
+  q.addEventListener('input', () => {
+    clearTimeout(deb);
+    deb = setTimeout(async () => {
+      const term = q.value.trim();
+      if (term.length < 2) { results.innerHTML = ''; return; }
+      const r = await api(`/api/players?q=${encodeURIComponent(term)}&all=1`);
+      results.innerHTML = r.players.slice(0, 8).map((p) => {
+        const here = p.team_id === teamId;
+        const status = p.fantasy_team ? `On ${esc(p.fantasy_team)}` : p.on_waivers ? 'Waivers' : 'Free agent';
+        return `<li><span><b>${esc(p.name)}</b> <span class="pmeta">${esc(p.pos)} ${esc(p.nfl || 'FA')}, ${status}</span></span>
+          ${here ? '<span class="muted" style="font-size:12px">On this team</span>'
+            : `<button class="btn sm ${p.fantasy_team ? '' : 'primary'}" data-add="${esc(p.id)}" data-name="${esc(p.name)}" data-from="${esc(p.fantasy_team || '')}">${p.fantasy_team ? 'Move here' : 'Add'}</button>`}</li>`;
+      }).join('') || '<li class="muted">No players match.</li>';
+      results.querySelectorAll('[data-add]').forEach((b) => b.addEventListener('click', async () => {
+        const from = b.dataset.from;
+        if (from && !confirm(`Move ${b.dataset.name} from ${from} to ${d.team.name}?`)) return;
+        if (await act(() => api(`/api/admin/teams/${teamId}/players`, { method: 'POST', admin: true, body: { player_id: b.dataset.add, move: !!from } }), `${b.dataset.name} added to ${d.team.name}`)) renderAdmin();
+      }));
+    }, 300);
+  });
 }
 
 function adminLogin(msg = '') {

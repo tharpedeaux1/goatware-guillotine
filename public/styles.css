@@ -354,3 +354,12 @@ img.avatar { object-fit: cover; background: #fff; }
 .swap-dialog::backdrop { background: rgba(11,42,56,.45); }
 .swap-choices { display: grid; gap: 8px; margin: 12px 0 4px; }
 .swap-choices .btn { justify-content: space-between; border-radius: 12px; padding: 10px 14px; color: var(--wf-ink); }
+
+/* ---------- news ---------- */
+.news-list .news-item { display: block; padding: 12px 0; }
+.news-meta { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; margin-bottom: 3px; }
+.news-head { font-size: 13.5px; color: var(--wf-ink); line-height: 1.45; }
+.news-item details { margin-top: 4px; }
+.news-item summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--wf-blue); }
+.news-item details p { font-size: 13px; color: var(--wf-ink-soft); margin: 6px 0 0; line-height: 1.5; }
+#player-dialog { max-height: 86vh; overflow-y: auto; }

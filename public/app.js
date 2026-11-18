@@ -303,7 +303,9 @@ async function renderTeam(id) {
   const slotCell = (p) => {
     if (!own) return '';
     const cur = Number(d.slots[p.slot]) > 0 ? p.slot : 'BN';
-    const opts = eligibleSlots(p.pos, d.slots, d.flex).map((s) => `<option ${s === cur ? 'selected' : ''}>${s}</option>`).join('');
+    const choices = eligibleSlots(p.pos, d.slots, d.flex).filter((s) => s !== 'IR');
+    if (d.ir_max > 0 && (p.slot === 'IR' || (p.injury && d.ir_statuses.includes(p.injury)))) choices.push('IR');
+    const opts = choices.map((s) => `<option ${s === cur ? 'selected' : ''}>${s}</option>`).join('');
     return `<td><select data-slot="${esc(p.id)}" aria-label="Slot for ${esc(p.name)}" ${p.locked ? 'disabled' : ''}>${opts}</select></td>`;
   };
   const dropCell = (p) => (own ? `<td class="r"><button class="btn sm danger" data-drop="${esc(p.id)}" data-name="${esc(p.name)}" ${p.locked ? 'disabled' : ''}>Drop</button></td>` : '');
@@ -319,7 +321,7 @@ async function renderTeam(id) {
   // Starters in slot order, with empty slots shown.
   const starterRows = [];
   for (const [slot, count] of Object.entries(d.slots)) {
-    if (slot === 'BN') continue;
+    if (slot === 'BN' || slot === 'IR') continue;
     const inSlot = d.starters.filter((p) => p.slot === slot);
     for (let i = 0; i < count; i++) {
       const p = inSlot[i];
@@ -327,7 +329,10 @@ async function renderTeam(id) {
     }
   }
   const head = `<thead><tr><th>Slot</th><th>Player</th><th class="hide-sm">Game</th><th class="r">Pts</th><th class="r hide-sm">Proj</th>${own ? '<th>Move to</th><th></th>' : ''}</tr></thead>`;
-  const rosterCount = d.starters.length + d.bench.length;
+  const irPlayers = d.bench.filter((p) => p.slot === 'IR');
+  const benchPlayers = d.bench.filter((p) => p.slot !== 'IR');
+  const rosterCount = d.starters.length + benchPlayers.length;
+  const over = rosterCount - d.roster_max;
 
   $app.innerHTML = `
     <section class="hero">
@@ -344,13 +349,17 @@ async function renderTeam(id) {
       { icon: 'target', color: 'green', value: pts(t.projected), label: 'Projected' },
       { icon: 'trophy', color: 'gold', value: pts(t.season_total), label: 'Season total' },
       { icon: 'wallet', color: 'navy', value: `$${t.faab}`, label: 'FAAB left' },
-      { icon: 'list', color: 'red', value: `${rosterCount}/${d.roster_max}`, label: 'Roster spots' },
+      { icon: 'list', color: 'red', value: `${rosterCount}/${d.roster_max}`, label: d.ir_max ? `Active spots, ${irPlayers.length}/${d.ir_max} IR` : 'Roster spots' },
     ], 'five')}
+    ${!t.eliminated_week && over > 0 ? `<div class="over-limit"><b>Over the roster limit.</b> This team has ${rosterCount} active players and the limit is ${d.roster_max}.
+      ${own ? `Drop ${over} player${over > 1 ? 's' : ''} or move an injured player to IR before adding anyone.` : 'The owner needs to drop players before adding anyone.'}</div>` : ''}
     ${t.eliminated_week ? '' : `
     <h2>Starters</h2>
     <div class="table-wrap"><table>${head}<tbody>${starterRows.join('')}</tbody></table></div>
     <h2>Bench</h2>
-    <div class="table-wrap"><table>${head}<tbody>${d.bench.map((p) => prow(p, 'BN')).join('') || `<tr><td colspan="7" class="muted">No bench players.</td></tr>`}</tbody></table></div>
+    <div class="table-wrap"><table>${head}<tbody>${benchPlayers.map((p) => prow(p, 'BN')).join('') || `<tr><td colspan="7" class="muted">No bench players.</td></tr>`}</tbody></table></div>
+    ${d.ir_max ? `<h2>Injured reserve <span class="muted" style="font-size:13px;font-weight:500">Doesn't count toward the ${d.roster_max}. For players listed ${esc(d.ir_statuses.join(', '))}.</span></h2>
+    <div class="table-wrap"><table>${head}<tbody>${irPlayers.map((p) => prow(p, 'IR')).join('')}${Array.from({ length: Math.max(0, d.ir_max - irPlayers.length) }, () => `<tr><td class="slot">IR</td><td class="empty-slot" colspan="${own ? 6 : 4}">Empty</td></tr>`).join('')}</tbody></table></div>` : ''}
     ${own ? `<div class="toolbar"><button class="btn primary" id="save-lineup">Save lineup</button><a class="btn" href="#players">Find players</a></div>` : ''}`}
     ${own && d.claims.length ? `<h2>Your waiver bids</h2><div class="panel"><ul class="list">${d.claims.map((c) => `
       <li><span><b>${esc(c.player)}</b> <span class="muted">${esc(c.pos)} ${esc(c.nfl || '')}</span> for <b>$${c.bid}</b>${c.drop_name ? `, dropping ${esc(c.drop_name)}` : ''}
@@ -559,7 +568,7 @@ async function renderAdmin() {
       <p class="muted">Send each owner their private link. Anyone with it can manage that team.</p>
       <div class="table-wrap"><table><thead><tr><th>Team</th><th>Owner</th><th class="r">FAAB</th><th class="r">Roster</th><th>Status</th><th>Last seen</th><th></th></tr></thead><tbody>
       ${d.teams.map((t) => `<tr><td><span style="display:inline-flex;align-items:center;gap:8px">${teamLogo(t.id, t.logo_v, t.name, 'sm')}<a href="#team/${t.id}">${esc(t.name)}</a></span></td><td>${esc(t.owner)}<div class="pmeta">${esc(t.email || '')}</div></td>
-        <td class="r">$${t.faab}</td><td class="r">${t.roster_size}</td><td>${t.eliminated_week ? `Cut wk ${lw(t.eliminated_week)}` : 'Alive'}</td>
+        <td class="r">$${t.faab}</td><td class="r"><span ${t.roster_size > d.roster_max ? 'style="color:var(--wf-red);font-weight:700" title="Over the active roster limit"' : ''}>${t.roster_size}/${d.roster_max}</span>${t.ir_size ? ` <span class="pmeta">+${t.ir_size} IR</span>` : ''}</td><td>${t.eliminated_week ? `Cut wk ${lw(t.eliminated_week)}` : 'Alive'}</td>
         <td>${isOnline(t.id) ? '<span class="online-chip"><span class="live-dot"></span>Online</span>' : t.last_seen ? `<span class="muted">${ago(t.last_seen)}</span>` : '<span class="muted">Never</span>'}</td>
         <td class="r" style="white-space:nowrap"><button class="btn sm" data-edit="${t.id}">Edit</button> <button class="btn sm" data-copy="${esc(link(t))}">Copy link</button> <button class="btn sm" data-regen="${t.id}">New link</button></td></tr>
         ${state.editTeam === t.id ? `<tr class="edit-row"><td colspan="7">
@@ -726,8 +735,10 @@ async function renderAdmin() {
       await renderAdmin();
       if (r.benched?.length) {
         const out = document.getElementById('op-result');
-        out.innerHTML = `<p><b>${r.benched.length} player${r.benched.length === 1 ? '' : 's'} moved to the bench</b> because their lineup slot was removed or has fewer spots now. Let those owners know to reset their lineups:</p>
-          <ul>${r.benched.map((b) => `<li>${esc(b.team)}: ${esc(b.player)} (was ${esc(b.from)})</li>`).join('')}</ul>`;
+        const toBench = r.benched.filter((b) => b.to === 'BN');
+        out.innerHTML = `<p><b>${r.benched.length} player${r.benched.length === 1 ? '' : 's'} moved</b> because their lineup slot was removed or has fewer spots now.
+          ${toBench.length ? `${toBench.length} went to the bench, so let those owners know to reset their lineups.` : 'All of them fit into another starting slot.'}</p>
+          <ul>${r.benched.map((b) => `<li>${esc(b.team)}: ${esc(b.player)}, ${esc(b.from)} to ${b.to === 'BN' ? '<b>bench</b>' : esc(b.to)}</li>`).join('')}</ul>`;
         out.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
     }
@@ -746,7 +757,7 @@ async function loadAdminRoster(teamId) {
   const d = await api(`/api/teams/${teamId}`);
   const players = [...d.starters, ...d.bench];
   box.innerHTML = `
-    <h3>Roster <span class="muted" style="font-weight:500">${players.length}/${d.roster_max}</span></h3>
+    <h3>Roster <span class="muted" style="font-weight:500">${players.filter((p) => p.slot !== 'IR').length}/${d.roster_max} active${d.ir_max ? `, ${players.filter((p) => p.slot === 'IR').length}/${d.ir_max} IR` : ''}</span></h3>
     <div class="adm-roster-grid">
       <div>
         <label class="check" style="margin-bottom:6px">Removed players go to

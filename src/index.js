@@ -31,6 +31,7 @@ const DEFAULT_SETTINGS = {
   league_name: 'Guillotine League',
   season: null,
   current_week: null,
+  first_week: 1,                   // NFL week that was the league's Week 1 (for display)
   faab_budget: 1000,
   cuts_per_week: 1,
   cuts_overrides: {},              // e.g. { "1": 2 } to cut two teams in week 1
@@ -93,12 +94,13 @@ const SCHEMA = [
   'CREATE TABLE IF NOT EXISTS team_weeks (season INTEGER NOT NULL, week INTEGER NOT NULL, team_id INTEGER NOT NULL, points REAL NOT NULL, bench REAL NOT NULL DEFAULT 0, rank INTEGER, eliminated INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (season, week, team_id))',
   'CREATE TABLE IF NOT EXISTS weekly_lineups (season INTEGER NOT NULL, week INTEGER NOT NULL, team_id INTEGER NOT NULL, player_id TEXT NOT NULL, slot TEXT NOT NULL, points REAL, PRIMARY KEY (season, week, team_id, player_id))',
   "CREATE TABLE IF NOT EXISTS transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL DEFAULT (datetime('now')), week INTEGER, type TEXT NOT NULL, team_id INTEGER, player_id TEXT, detail TEXT)",
+  'CREATE TABLE IF NOT EXISTS presence (vid TEXT PRIMARY KEY, team_id INTEGER, page TEXT, last_seen INTEGER NOT NULL)',
+  'CREATE INDEX IF NOT EXISTS idx_presence_seen ON presence(last_seen)',
 ];
 let schemaReady = false;
 async function ensureSchema(env) {
   if (schemaReady) return;
-  const t = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'transactions'").first();
-  if (!t) await env.DB.batch(SCHEMA.map((q) => env.DB.prepare(q)));
+  await env.DB.batch(SCHEMA.map((q) => env.DB.prepare(q))); // all IF NOT EXISTS, so safe to repeat
   schemaReady = true;
 }
 
@@ -132,6 +134,12 @@ async function tick(env) {
     return;
   }
 
+  // Forget devices not seen in 30 days.
+  if ((await getKV(env, 'presence_cleaned')) !== today) {
+    await setKV(env, 'presence_cleaned', today);
+    await env.DB.prepare('DELETE FROM presence WHERE last_seen < ?').bind(Date.now() - 30 * 86400e3).run();
+  }
+
   // Refresh one position of the NFL player list per run, each about once a day.
   let oldest = null;
   for (const pos of FANTASY_POS) {
@@ -158,6 +166,7 @@ async function route(req, env, ctx, url) {
   if (m === 'GET' && p === '/api/players') return json(await apiPlayers(env, url));
   if (m === 'GET' && (mt = p.match(/^\/api\/players\/([^/]+)$/))) return json(await apiPlayer(env, decodeURIComponent(mt[1])));
   if (m === 'GET' && p === '/api/activity') return json(await apiActivity(env));
+  if (m === 'POST' && p === '/api/presence') return json(await apiPresence(env, req, await body()));
 
   // Team owner (secret link token)
   if (p === '/api/me' || p.startsWith('/api/me/')) {
@@ -185,6 +194,7 @@ async function route(req, env, ctx, url) {
     if (m === 'POST' && p === '/api/admin/waivers') return json(await processWaivers(env));
     if (m === 'PUT' && (mt = p.match(/^\/api\/admin\/teams\/(\d+)$/))) return json(await adminUpdateTeam(env, Number(mt[1]), await body()));
     if (m === 'POST' && (mt = p.match(/^\/api\/admin\/teams\/(\d+)\/token$/))) return json(await adminNewToken(env, Number(mt[1])));
+    if (m === 'POST' && (mt = p.match(/^\/api\/admin\/teams\/(\d+)\/cut$/))) return json(await adminCutTeam(env, Number(mt[1]), await body()));
     if (m === 'POST' && p === '/api/admin/reset') return json(await adminReset(env, await body()));
   }
 
@@ -487,7 +497,7 @@ async function apiLive(env, ctx) {
   const cuts = Math.min(cutsForWeek(s, wk.week), Math.max(alive.length - 1, 0));
   const champion = s.champion_team_id ? wk.teams.find((t) => t.id === s.champion_team_id) : null;
   return {
-    league: s.league_name, season: wk.season, week: wk.week, cuts,
+    league: s.league_name, season: wk.season, week: wk.week, first_week: s.first_week || 1, cuts,
     champion: champion ? { id: champion.id, name: champion.name, owner: champion.owner } : null,
     eliminated_count: wk.teams.length - alive.length,
     stats_updated: Number((await getKV(env, `stats_at:${wk.season}:${wk.week}`)) || 0),
@@ -522,7 +532,7 @@ async function apiTeam(env, id, req) {
       WHERE c.team_id = ? ORDER BY c.id DESC LIMIT 30`).bind(id).all()).results;
   }
   return {
-    season: wk.season, week: wk.week, is_owner,
+    season: wk.season, week: wk.week, first_week: s.first_week || 1, is_owner,
     team: {
       id: t.id, name: t.name, owner: t.owner, faab: t.faab, eliminated_week: t.eliminated_week,
       points: t.points, projected: t.projected, bench_points: t.bench_points, season_total: t.season_total,
@@ -538,7 +548,7 @@ async function apiGraveyard(env) {
   const r = await env.DB.prepare(`SELECT t.id, t.name, t.owner, t.eliminated_week, tw.points
     FROM teams t LEFT JOIN team_weeks tw ON tw.team_id = t.id AND tw.week = t.eliminated_week AND tw.season = ?
     WHERE t.eliminated_week IS NOT NULL ORDER BY t.eliminated_week DESC, tw.points ASC`).bind(s.season).all();
-  return { teams: r.results };
+  return { first_week: s.first_week || 1, teams: r.results };
 }
 
 async function apiPlayers(env, url) {
@@ -570,7 +580,7 @@ async function apiPlayers(env, url) {
       locked: isLocked(g, now), game: gameFor(g, r.nfl), state: g ? g.state : 'bye',
     };
   }).sort((a, b) => b.proj - a.proj || b.points - a.points).slice(0, 150);
-  return { week: s.current_week, instant_free_agents: s.instant_free_agents, players };
+  return { week: s.current_week, first_week: s.first_week || 1, instant_free_agents: s.instant_free_agents, players };
 }
 
 async function apiPlayer(env, id) {
@@ -589,7 +599,7 @@ async function apiPlayer(env, id) {
     .map(([key, value]) => ({ key, value, weight: weights[key] ?? null, points: weights[key] != null ? round2(value * weights[key]) : null }))
     .sort((a, b) => Math.abs(b.points || 0) - Math.abs(a.points || 0));
   return {
-    week: s.current_week, preset: s.scoring?.preset || 'custom',
+    week: s.current_week, first_week: s.first_week || 1, preset: s.scoring?.preset || 'custom',
     player: { id: p.id, name: p.name, pos: p.pos, nfl: p.team, injury: p.injury, fantasy_team: p.fantasy_team },
     points: playerPoints(st, s.scoring), proj: playerPoints(proj[id], s.scoring), breakdown,
   };
@@ -600,6 +610,37 @@ async function apiActivity(env) {
     FROM transactions x LEFT JOIN teams t ON t.id = x.team_id LEFT JOIN players p ON p.id = x.player_id
     ORDER BY x.id DESC LIMIT 150`).all();
   return { items: r.results };
+}
+
+// ---------------------------------------------------------------- presence
+
+const ONLINE_MS = 2 * 60e3;
+const PAGES = ['live', 'team', 'players', 'graveyard', 'activity'];
+
+// Each open tab sends a heartbeat about every 45 seconds while visible.
+async function apiPresence(env, req, body) {
+  const vid = String(body.vid || '');
+  if (!/^[a-z0-9]{8,40}$/i.test(vid)) throw new HttpError(400, 'Bad visitor id.');
+  const page = PAGES.includes(body.page) ? body.page : 'live';
+  const token = req.headers.get('x-team-token');
+  const team = token ? await env.DB.prepare('SELECT id FROM teams WHERE token = ?').bind(token).first() : null;
+  await env.DB.prepare(`INSERT INTO presence (vid, team_id, page, last_seen) VALUES (?, ?, ?, ?)
+    ON CONFLICT(vid) DO UPDATE SET team_id = excluded.team_id, page = excluded.page, last_seen = excluded.last_seen`)
+    .bind(vid, team ? team.id : null, page, Date.now()).run();
+  return onlineSummary(env);
+}
+
+async function onlineSummary(env) {
+  const since = Date.now() - ONLINE_MS;
+  const rows = (await env.DB.prepare(`SELECT p.team_id, p.page, p.last_seen, t.name, t.owner
+    FROM presence p LEFT JOIN teams t ON t.id = p.team_id WHERE p.last_seen > ? ORDER BY p.last_seen DESC`).bind(since).all()).results;
+  const owners = new Map();
+  let guests = 0;
+  for (const r of rows) {
+    if (!r.team_id || !r.name) { guests += 1; continue; }
+    if (!owners.has(r.team_id)) owners.set(r.team_id, { team_id: r.team_id, team: r.name, owner: r.owner, page: r.page });
+  }
+  return { owners: [...owners.values()], guests };
 }
 
 // ---------------------------------------------------------------- owner actions
@@ -823,6 +864,8 @@ async function adminOverview(env) {
   const s = await getSettings(env);
   const teams = (await env.DB.prepare(`SELECT t.id, t.name, t.owner, t.email, t.token, t.faab, t.eliminated_week,
       (SELECT COUNT(*) FROM rosters r WHERE r.team_id = t.id) AS roster_size FROM teams t ORDER BY t.name`).all()).results;
+  const seen = Object.fromEntries((await env.DB.prepare('SELECT team_id, MAX(last_seen) AS t FROM presence WHERE team_id IS NOT NULL GROUP BY team_id').all()).results.map((r) => [r.team_id, r.t]));
+  for (const t of teams) t.last_seen = seen[t.id] || null;
   const playerCount = (await env.DB.prepare('SELECT COUNT(*) AS n FROM players').first()).n;
   const pendingClaims = (await env.DB.prepare("SELECT COUNT(*) AS n FROM claims WHERE status = 'pending'").first()).n;
   const wk = s.season ? `${s.season}:${s.current_week}` : '';
@@ -844,6 +887,7 @@ async function adminSettings(env, body) {
   next.current_week = Math.max(1, Math.min(18, Number(next.current_week) || current.current_week || 1));
   next.faab_budget = Math.max(0, Number(next.faab_budget) || 0);
   next.cuts_per_week = Math.max(1, Number(next.cuts_per_week) || 1);
+  next.first_week = Math.max(1, Math.min(18, Number(next.first_week) || 1));
   if (!next.roster_slots || typeof next.roster_slots !== 'object') throw new HttpError(400, 'roster_slots must be an object like {"QB":1,"BN":6}.');
   for (const [k, v] of Object.entries(next.roster_slots)) {
     if (!Number.isInteger(Number(v)) || Number(v) < 0) throw new HttpError(400, `roster_slots.${k} must be a whole number.`);
@@ -877,6 +921,37 @@ async function adminUpdateTeam(env, id, body) {
     throw e;
   }
   return { ok: true };
+}
+
+// Manually cut a team (for weeks scored outside the site, or corrections).
+// body: { week: NFL week number, points?: final score }. Released players go to waivers.
+async function adminCutTeam(env, id, body) {
+  const s = await getSettings(env);
+  const t = await env.DB.prepare('SELECT * FROM teams WHERE id = ?').bind(id).first();
+  if (!t) throw new HttpError(404, 'Team not found.');
+  if (t.eliminated_week) throw new HttpError(409, `${t.name} was already cut.`);
+  const week = Number(body.week);
+  if (!Number.isInteger(week) || week < 1 || week > 18) throw new HttpError(400, 'Pick the week this team was cut.');
+  const hasPoints = body.points !== '' && body.points != null && Number.isFinite(Number(body.points));
+  const leagueWeek = week - (s.first_week || 1) + 1;
+  const stmts = [
+    env.DB.prepare('UPDATE teams SET eliminated_week = ? WHERE id = ?').bind(week, id),
+    env.DB.prepare("UPDATE claims SET status = 'failed', reason = 'Team was cut', processed_at = datetime('now') WHERE team_id = ? AND status = 'pending'").bind(id),
+  ];
+  stmts.push(env.DB.prepare('INSERT OR IGNORE INTO waiver_wire (player_id) SELECT player_id FROM rosters WHERE team_id = ?').bind(id));
+  stmts.push(env.DB.prepare('DELETE FROM rosters WHERE team_id = ?').bind(id));
+  // Record the final score for past weeks only, so the current week can still be finalized normally.
+  if (hasPoints && week < s.current_week) {
+    stmts.push(env.DB.prepare('INSERT OR REPLACE INTO team_weeks (season, week, team_id, points, bench, rank, eliminated) VALUES (?, ?, ?, ?, 0, NULL, 1)')
+      .bind(s.season, week, id, round2(body.points)));
+  }
+  stmts.push(env.DB.prepare("INSERT INTO transactions (week, type, team_id, detail) VALUES (?, 'eliminated', ?, ?)")
+    .bind(week, id, `Cut in week ${leagueWeek} by the commissioner${hasPoints ? ` with ${Number(body.points).toFixed(2)} pts` : ''}. Players released to waivers`));
+  await env.DB.batch(stmts);
+
+  const alive = (await env.DB.prepare('SELECT id FROM teams WHERE eliminated_week IS NULL').all()).results;
+  if (alive.length === 1) { s.champion_team_id = alive[0].id; await saveSettings(env, s); }
+  return { ok: true, team: t.name, week };
 }
 
 const newToken = () => crypto.randomUUID().replace(/-/g, '').slice(0, 24);

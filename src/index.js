@@ -102,7 +102,7 @@ let schemaReady = false;
 async function ensureSchema(env) {
   if (schemaReady) return;
   await env.DB.batch(SCHEMA.map((q) => env.DB.prepare(q))); // all IF NOT EXISTS, so safe to repeat
-  for (const q of ['ALTER TABLE teams ADD COLUMN logo TEXT', 'ALTER TABLE teams ADD COLUMN logo_v INTEGER']) {
+  for (const q of ['ALTER TABLE teams ADD COLUMN logo TEXT', 'ALTER TABLE teams ADD COLUMN logo_v INTEGER', 'ALTER TABLE claims ADD COLUMN run_id INTEGER']) {
     try { await env.DB.prepare(q).run(); } catch { /* column already exists */ }
   }
   schemaReady = true;
@@ -167,7 +167,8 @@ async function route(req, env, ctx, url) {
   if (m === 'GET' && p === '/api/live') return json(await apiLive(env, ctx));
   if (m === 'GET' && (mt = p.match(/^\/api\/teams\/(\d+)$/))) return json(await apiTeam(env, Number(mt[1]), req));
   if (m === 'GET' && p === '/api/graveyard') return json(await apiGraveyard(env));
-  if (m === 'GET' && p === '/api/players') return json(await apiPlayers(env, url));
+  if (m === 'GET' && p === '/api/players') return json(await apiPlayers(env, url, req));
+  if (m === 'GET' && p === '/api/waivers/results') return json(await apiWaiverResults(env));
   if (m === 'GET' && (mt = p.match(/^\/api\/players\/([^/]+)$/))) return json(await apiPlayer(env, decodeURIComponent(mt[1])));
   if (m === 'GET' && p === '/api/activity') return json(await apiActivity(env));
   if (m === 'POST' && p === '/api/presence') return json(await apiPresence(env, req, await body()));
@@ -541,7 +542,9 @@ async function apiTeam(env, id, req) {
   let claims = [];
   if (is_owner) {
     claims = (await env.DB.prepare(`SELECT c.id, c.bid, c.status, c.reason, c.created_at, c.player_id,
-        p.name AS player, p.pos, p.team AS nfl, d.name AS drop_name
+        p.name AS player, p.pos, p.team AS nfl, d.name AS drop_name,
+        CASE WHEN c.status = 'pending' THEN (SELECT COUNT(*) FROM claims o WHERE o.player_id = c.player_id AND o.status = 'pending' AND o.team_id != c.team_id) END AS other_bids,
+        (SELECT w.bid FROM claims w WHERE w.player_id = c.player_id AND w.run_id = c.run_id AND w.status = 'won') AS winning_bid
       FROM claims c LEFT JOIN players p ON p.id = c.player_id LEFT JOIN players d ON d.id = c.drop_player_id
       WHERE c.team_id = ? ORDER BY c.id DESC LIMIT 30`).bind(id).all()).results;
   }
@@ -565,8 +568,18 @@ async function apiGraveyard(env) {
   return { first_week: s.first_week || 1, teams: r.results };
 }
 
-async function apiPlayers(env, url) {
+async function apiPlayers(env, url, req) {
   const s = await getSettings(env);
+  const token = req.headers.get('x-team-token');
+  const me = token ? await env.DB.prepare('SELECT id FROM teams WHERE token = ?').bind(token).first() : null;
+  const pending = (await env.DB.prepare(`SELECT c.id, c.player_id, c.team_id, c.bid, c.drop_player_id, d.name AS drop_name
+    FROM claims c LEFT JOIN players d ON d.id = c.drop_player_id WHERE c.status = 'pending'`).all()).results;
+  const otherBids = {};
+  const myBids = {};
+  for (const c of pending) {
+    if (me && c.team_id === me.id) myBids[c.player_id] = { id: c.id, bid: c.bid, drop_player_id: c.drop_player_id, drop_name: c.drop_name };
+    else otherBids[c.player_id] = (otherBids[c.player_id] || 0) + 1;
+  }
   const pos = (url.searchParams.get('pos') || '').toUpperCase();
   const q = (url.searchParams.get('q') || '').trim();
   const all = url.searchParams.get('all') === '1';
@@ -592,8 +605,9 @@ async function apiPlayers(env, url) {
       team_id: r.team_id, fantasy_team: r.fantasy_team, on_waivers: !!r.on_waivers,
       points: playerPoints(stats[r.id], s.scoring), proj: playerPoints(proj[r.id], s.scoring),
       locked: isLocked(g, now), game: gameFor(g, r.nfl), state: g ? g.state : 'bye',
+      other_bids: otherBids[r.id] || 0, my_bid: myBids[r.id] || null,
     };
-  }).sort((a, b) => b.proj - a.proj || b.points - a.points).slice(0, 150);
+  }).sort((a, b) => (b.my_bid ? 1 : 0) - (a.my_bid ? 1 : 0) || b.proj - a.proj || b.points - a.points).slice(0, 150);
   return { week: s.current_week, first_week: s.first_week || 1, instant_free_agents: s.instant_free_agents, players, byes: await getByes(env, s.season) };
 }
 
@@ -617,6 +631,27 @@ async function apiPlayer(env, id) {
     player: { id: p.id, name: p.name, pos: p.pos, nfl: p.team, injury: p.injury, fantasy_team: p.fantasy_team },
     points: playerPoints(st, s.scoring), proj: playerPoints(proj[id], s.scoring), breakdown,
   };
+}
+
+// Results of the last few waiver runs. Only processed bids are ever shown; pending bids stay secret.
+async function apiWaiverResults(env) {
+  const s = await getSettings(env);
+  const rows = (await env.DB.prepare(`SELECT c.run_id, c.player_id, c.team_id, c.bid, c.status, c.reason,
+      p.name AS player, p.pos, p.team AS nfl, t.name AS team, t.logo_v
+    FROM claims c LEFT JOIN players p ON p.id = c.player_id LEFT JOIN teams t ON t.id = c.team_id
+    WHERE c.run_id IN (SELECT DISTINCT run_id FROM claims WHERE run_id IS NOT NULL ORDER BY run_id DESC LIMIT 3)
+    ORDER BY c.run_id DESC, c.player_id, c.bid DESC`).all()).results;
+  const runs = [];
+  for (const r of rows) {
+    let run = runs.find((x) => x.run_id === r.run_id);
+    if (!run) { run = { run_id: r.run_id, players: [] }; runs.push(run); }
+    let pl = run.players.find((x) => x.player_id === r.player_id);
+    if (!pl) { pl = { player_id: r.player_id, player: r.player, pos: r.pos, nfl: r.nfl, winner: null, bids: [] }; run.players.push(pl); }
+    pl.bids.push({ team_id: r.team_id, team: r.team, logo_v: r.logo_v, bid: r.bid, status: r.status, reason: r.reason });
+    if (r.status === 'won') pl.winner = { team_id: r.team_id, team: r.team, bid: r.bid };
+  }
+  for (const run of runs) run.players.sort((a, b) => (b.winner ? b.winner.bid : -1) - (a.winner ? a.winner.bid : -1));
+  return { first_week: s.first_week || 1, runs };
 }
 
 async function apiActivity(env) {
@@ -814,11 +849,13 @@ async function createClaim(env, team, { player_id, drop_player_id, bid }) {
   if (drop_player_id && !(await env.DB.prepare('SELECT 1 FROM rosters WHERE player_id = ? AND team_id = ?').bind(drop_player_id, team.id).first())) {
     throw new HttpError(400, 'The player you chose to drop is not on your roster.');
   }
-  await env.DB.batch([
-    env.DB.prepare("DELETE FROM claims WHERE team_id = ? AND player_id = ? AND status = 'pending'").bind(team.id, player_id),
-    env.DB.prepare('INSERT INTO claims (team_id, player_id, drop_player_id, bid) VALUES (?, ?, ?, ?)').bind(team.id, player_id, drop_player_id || null, amount),
-  ]);
-  return { ok: true };
+  const existing = await env.DB.prepare("SELECT id FROM claims WHERE team_id = ? AND player_id = ? AND status = 'pending'").bind(team.id, player_id).first();
+  if (existing) {
+    await env.DB.prepare('UPDATE claims SET bid = ?, drop_player_id = ? WHERE id = ?').bind(amount, drop_player_id || null, existing.id).run();
+    return { ok: true, updated: true };
+  }
+  await env.DB.prepare('INSERT INTO claims (team_id, player_id, drop_player_id, bid) VALUES (?, ?, ?, ?)').bind(team.id, player_id, drop_player_id || null, amount).run();
+  return { ok: true, updated: false };
 }
 
 async function cancelClaim(env, team, id) {
@@ -896,7 +933,8 @@ async function processWaivers(env) {
 
   const stmts = [];
   const newlyDropped = [];
-  const resolve = (c, status, reason) => stmts.push(env.DB.prepare("UPDATE claims SET status = ?, reason = ?, processed_at = datetime('now') WHERE id = ?").bind(status, reason, c.id));
+  const runId = Date.now();
+  const resolve = (c, status, reason) => stmts.push(env.DB.prepare("UPDATE claims SET status = ?, reason = ?, run_id = ?, processed_at = datetime('now') WHERE id = ?").bind(status, reason, runId, c.id));
   let pending = [...claims];
   let won = 0;
   while (pending.length) {

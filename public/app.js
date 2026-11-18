@@ -30,7 +30,13 @@ const STAT_LABELS = {
   fgm: 'FG made', fga: 'FG attempts', xpm: 'XP made', xpa: 'XP attempts', fgmiss: 'FG missed', xpmiss: 'XP missed',
   fgm_0_19: 'FG 0-19', fgm_20_29: 'FG 20-29', fgm_30_39: 'FG 30-39', fgm_40_49: 'FG 40-49', fgm_50p: 'FG 50+',
   sack: 'Sacks', int: 'Interceptions', fum_rec: 'Fumble recoveries', def_td: 'Defensive TD', def_st_td: 'Def/ST TD',
-  safe: 'Safeties', blk_kick: 'Blocked kicks', pts_allow: 'Points allowed',
+  safe: 'Safeties', blk_kick: 'Blocked kicks', pts_allow: 'Points allowed', yds_allow: 'Yards allowed',
+  fum_rec_td: 'Fumble return TD', def_kr_yd: 'Kick return yards', def_pr_yd: 'Punt return yards', def_st_td: 'Return TD',
+  def_2pt: 'Extra point returned', pts_allow_0: 'Shutout', pts_allow_1_6: 'Allowed 1-6', pts_allow_7_13: 'Allowed 7-13', pts_allow_14_20: 'Allowed 14-20',
+  'pass_yd 300+ bonus': '300+ passing yards', 'pass_yd 600+ bonus': '600+ passing yards',
+  'rush_yd 100+ bonus': '100+ rushing yards', 'rush_yd 200+ bonus': '200+ rushing yards', 'rush_yd 300+ bonus': '300+ rushing yards',
+  'rec_yd 100+ bonus': '100+ receiving yards', 'rec_yd 200+ bonus': '200+ receiving yards', 'rec_yd 300+ bonus': '300+ receiving yards',
+  'yds_allow 0-99': 'Allowed 0-99 yards', 'yds_allow 100-199': 'Allowed 100-199 yards', 'yds_allow 200-299': 'Allowed 200-299 yards',
 };
 
 // ------------------------------------------------------------ helpers

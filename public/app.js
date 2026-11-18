@@ -9,7 +9,12 @@ const state = {
   filter: { pos: '', q: '', all: false },
   openRow: null,
   editTeam: null,
+  firstWeek: 1,
+  online: { owners: [], guests: 0 },
+  presenceOpen: false,
 };
+// League week number for an NFL week (first_week is the NFL week that was the league's Week 1).
+const lw = (w) => Number(w) - (state.firstWeek || 1) + 1;
 
 const STAT_LABELS = {
   pass_yd: 'Passing yards', pass_td: 'Passing TD', pass_int: 'Interceptions thrown', pass_2pt: 'Passing 2-pt',
@@ -96,6 +101,58 @@ const tiles = (items, cls = '') => `<div class="stat-tiles ${cls}">${items.map((
   <div class="stat-card"><div class="stat-icon ${t.color}"><svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[t.icon]}</svg></div>
   <div><div class="stat-value">${t.value}</div><div class="stat-label">${t.label}</div></div></div>`).join('')}</div>`;
 
+// ------------------------------------------------------------ presence (who's online)
+const VID = (() => {
+  let v = localStorage.getItem('gl_vid');
+  if (!v) { v = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()) + Date.now()).replace(/[^a-z0-9]/gi, '').slice(0, 24); localStorage.setItem('gl_vid', v); }
+  return v;
+})();
+const PAGE_LABEL = { live: 'Watching the Chopping Block', team: 'Looking at a team', players: 'Browsing players', graveyard: 'Visiting the Graveyard', activity: 'Reading Activity' };
+const AVATAR_COLORS = ['#007CBC', '#5FA845', '#E8536A', '#9A6A12', '#4E8DF5', '#0B2A38', '#00618f', '#4c8637'];
+const initials = (o) => (o.owner || o.team || '?').split(/\s+/).map((w) => (w.match(/[a-z0-9]/i) || [''])[0]).filter(Boolean).slice(0, 2).join('').toUpperCase() || '?';
+const avatar = (o) => `<span class="avatar" style="background:${AVATAR_COLORS[o.team_id % AVATAR_COLORS.length]}" aria-hidden="true">${esc(initials(o))}</span>`;
+const isOnline = (teamId) => state.online.owners.some((o) => o.team_id === teamId);
+
+async function heartbeat() {
+  if (document.hidden) return;
+  const view = (location.hash.slice(1) || 'live').split('/')[0];
+  try {
+    state.online = await api('/api/presence', { method: 'POST', body: { vid: VID, page: view === 'admin' ? 'live' : view } });
+    renderPresence();
+  } catch { /* presence is best-effort */ }
+}
+
+function renderPresence() {
+  const el = document.getElementById('presence');
+  const { owners, guests } = state.online;
+  const others = owners.filter((o) => !state.me || o.team_id !== state.me.id);
+  const total = owners.length + guests;
+  if (!total) { el.innerHTML = ''; return; }
+  const shown = owners.slice(0, 4);
+  const extra = owners.length - shown.length;
+  const label = others.length ? `${others.length} other owner${others.length > 1 ? 's' : ''} online` : (guests ? `${total} viewing` : 'Just you');
+  el.innerHTML = `
+    <button class="presence-btn ${shown.length ? '' : 'solo'}" id="presence-btn" aria-expanded="${state.presenceOpen}" aria-controls="presence-pop">
+      ${shown.length ? `<span class="avatars">${shown.map(avatar).join('')}${extra > 0 ? `<span class="avatar more">+${extra}</span>` : ''}</span>` : '<span class="live-dot" aria-hidden="true"></span>'}
+      <span class="pl-long">${label}</span><span class="pl-short">${total} online</span>
+    </button>
+    ${state.presenceOpen ? `<div class="presence-pop" id="presence-pop">
+      <h4>Online now</h4>
+      <ul>${owners.map((o) => `<li><a href="#team/${o.team_id}">${avatar(o)}<span style="min-width:0">
+        <span class="pp-name">${esc(o.owner || o.team)}${state.me && o.team_id === state.me.id ? ' (you)' : ''}</span>
+        <div class="pp-sub">${o.owner ? `${esc(o.team)}. ` : ''}${esc(PAGE_LABEL[o.page] || 'Browsing')}</div></span></a></li>`).join('') || '<li class="muted" style="font-size:12px">No owners online yet.</li>'}</ul>
+      ${guests ? `<div class="pp-guests">${guests} guest${guests > 1 ? 's' : ''} watching without a team link</div>` : ''}
+    </div>` : ''}`;
+  document.getElementById('presence-btn').onclick = (e) => { e.stopPropagation(); state.presenceOpen = !state.presenceOpen; renderPresence(); };
+  // Green dots next to team names that are online right now.
+  document.querySelectorAll('[data-team-id]').forEach((n) => n.classList.toggle('is-online', isOnline(Number(n.dataset.teamId))));
+}
+document.addEventListener('click', (e) => {
+  if (state.presenceOpen && !e.target.closest('#presence')) { state.presenceOpen = false; renderPresence(); }
+});
+document.addEventListener('visibilitychange', () => { if (!document.hidden) heartbeat(); });
+setInterval(heartbeat, 45000);
+
 // ------------------------------------------------------------ router
 async function router() {
   clearInterval(state.timer);
@@ -130,8 +187,9 @@ async function router() {
 // ------------------------------------------------------------ chopping block
 async function renderLive() {
   const d = await api('/api/live');
+  state.firstWeek = d.first_week || 1;
   document.getElementById('league-name').textContent = d.league;
-  document.title = `Week ${d.week}, ${d.league}`;
+  document.title = `Week ${lw(d.week)}, ${d.league}`;
   const live = d.games.filter((g) => g.state === 'in').length;
   const final = d.games.filter((g) => g.state === 'post').length;
   const pre = d.games.length - live - final;
@@ -146,16 +204,18 @@ async function renderLive() {
   const doomed = d.alive.slice(n - d.cuts);
   const gap = safe.length && doomed.length ? safe[safe.length - 1].projected - doomed[0].projected : null;
   const row = (t, rank, cls) => `
-    <li class="row ${cls}"><a href="#team/${t.id}">
+    <li class="row ${cls} ${isOnline(t.id) ? 'is-online' : ''}" data-team-id="${t.id}"><a href="#team/${t.id}">
       <span class="rank">${rank}</span>
-      <span class="who"><span class="tname">${esc(t.name)}</span><span class="owner">${esc(t.owner)}</span></span>
+      <span class="who"><span class="tname">${esc(t.name)}<i class="on-dot" title="Online now"></i></span><span class="owner">${esc(t.owner)}</span></span>
       <span class="pips" title="Starters: ${t.pips.filter((p) => p === 'pre').length} to play, ${t.pips.filter((p) => p === 'in').length} playing, ${t.pips.filter((p) => p === 'post').length} done">${t.pips.map((p) => `<i class="pip ${p}"></i>`).join('')}</span>
       <span class="score"><b>${pts(t.points)}</b><small>${t.pips.some((x) => x === 'pre' || x === 'in') ? `proj ${pts(t.projected)}` : 'final'}</small></span>
     </a></li>`;
 
   $app.innerHTML = `
+    <img class="banner" src="/banner.jpg" srcset="/banner-1200.jpg 1200w, /banner.jpg 2172w" sizes="(max-width: 1180px) 100vw, 1124px"
+      width="2172" height="724" alt="Goatware: Fantasy football. Like a GOAT.">
     <section class="hero">
-      <h1>Week ${d.week} <em>Chopping Block</em></h1>
+      <h1>Week ${lw(d.week)} <em>Chopping Block</em></h1>
       <p>${status}</p>
     </section>
     ${tiles([
@@ -186,6 +246,7 @@ async function renderLive() {
 // ------------------------------------------------------------ team page
 async function renderTeam(id) {
   const d = await api(`/api/teams/${id}`);
+  state.firstWeek = d.first_week || 1;
   const own = d.is_owner && !d.team.eliminated_week;
   const t = d.team;
   document.title = t.name;
@@ -223,10 +284,10 @@ async function renderTeam(id) {
   $app.innerHTML = `
     <section class="hero">
       <h1>${esc(t.name)}</h1>
-      <p>${esc(t.owner)} ${t.eliminated_week ? `<span class="badge cut">Cut in week ${t.eliminated_week}</span>` : '<span class="badge alive">Alive</span>'}</p>
+      <p>${esc(t.owner)} ${isOnline(t.id) ? '<span class="online-chip"><span class="live-dot"></span>Online now</span>' : ''} ${t.eliminated_week ? `<span class="badge cut">Cut in week ${lw(t.eliminated_week)}</span>` : '<span class="badge alive">Alive</span>'}</p>
     </section>
     ${tiles([
-      { icon: 'chart', color: 'blue', value: pts(t.points), label: `Week ${d.week} points` },
+      { icon: 'chart', color: 'blue', value: pts(t.points), label: `Week ${lw(d.week)} points` },
       { icon: 'target', color: 'green', value: pts(t.projected), label: 'Projected' },
       { icon: 'trophy', color: 'gold', value: pts(t.season_total), label: 'Season total' },
       { icon: 'wallet', color: 'navy', value: `$${t.faab}`, label: 'FAAB left' },
@@ -244,7 +305,7 @@ async function renderTeam(id) {
         ${c.status === 'pending' ? `<button class="btn sm" data-cancel="${c.id}">Cancel bid</button>` : `<span class="muted">${esc(c.status)}</span>`}
       </li>`).join('')}</ul></div>` : ''}
     ${d.history.length ? `<h2>Weekly results</h2><div class="panel"><ul class="list">${d.history.map((h) => `
-      <li><span>Week ${h.week}${h.eliminated ? ' <span class="badge cut">Cut</span>' : ''}</span><span class="num">${pts(h.points)} <span class="muted">rank ${h.rank}</span></span></li>`).join('')}</ul></div>` : ''}
+      <li><span>Week ${lw(h.week)}${h.eliminated ? ' <span class="badge cut">Cut</span>' : ''}</span><span class="num">${pts(h.points)} <span class="muted">rank ${h.rank}</span></span></li>`).join('')}</ul></div>` : ''}
     ${d.is_owner ? '' : (state.me ? '' : `<p class="muted" style="margin-top:24px">Managing this team? Open the private link the commissioner sent you.</p>`)}`;
 
   bindPlayerLinks();
@@ -272,6 +333,7 @@ async function renderPlayers() {
     api(`/api/players?${qs}`),
     state.me && !state.me.eliminated_week ? api(`/api/teams/${state.me.id}`) : Promise.resolve(null),
   ]);
+  state.firstWeek = d.first_week || 1;
   const myRoster = mine ? [...mine.starters, ...mine.bench] : [];
   const dropOptions = `<option value="">No drop</option>${myRoster.map((p) => `<option value="${esc(p.id)}" ${p.locked ? 'disabled' : ''}>${esc(p.name)} (${esc(p.pos)})${p.locked ? ' locked' : ''}</option>`).join('')}`;
   const canAct = !!mine;
@@ -302,7 +364,7 @@ async function renderPlayers() {
       <label class="check"><input type="checkbox" id="all" ${f.all ? 'checked' : ''}> Include rostered</label>
     </div>
     <div class="table-wrap"><table>
-      <thead><tr><th>Player</th><th class="hide-sm">Game</th><th>Status</th><th class="r">Wk ${d.week}</th><th class="r">Proj</th><th></th></tr></thead>
+      <thead><tr><th>Player</th><th class="hide-sm">Game</th><th>Status</th><th class="r">Wk ${lw(d.week)}</th><th class="r">Proj</th><th></th></tr></thead>
       <tbody>${d.players.map((p) => `<tr>
         <td><button class="pname" data-player="${esc(p.id)}">${esc(p.name)}</button>${p.injury ? `<span class="inj">${esc(p.injury)}</span>` : ''}<div class="pmeta">${esc(p.pos)} ${esc(p.nfl || 'FA')}</div></td>
         <td class="hide-sm">${gameText(p.game)}</td>
@@ -346,7 +408,7 @@ async function showPlayer(id) {
     body.innerHTML = `
       <h2 id="pd-title">${esc(p.name)}</h2>
       <p class="muted">${esc(p.pos)} ${esc(p.nfl || 'FA')}${p.injury ? `, ${esc(p.injury)}` : ''}${p.fantasy_team ? `. On ${esc(p.fantasy_team)}` : '. Unrostered'}</p>
-      <p>Week ${d.week}: <b class="num">${pts(d.points)}</b> points, projected <span class="num">${pts(d.proj)}</span>${d.preset !== 'custom' ? ` (${esc(d.preset.replace('_', ' '))} scoring)` : ''}.</p>
+      <p>Week ${lw(d.week)}: <b class="num">${pts(d.points)}</b> points, projected <span class="num">${pts(d.proj)}</span>${d.preset !== 'custom' ? ` (${esc(d.preset.replace('_', ' '))} scoring)` : ''}.</p>
       ${d.breakdown.length ? `<div class="table-wrap"><table><thead><tr><th>Stat</th><th class="r">Value</th><th class="r">Pts each</th><th class="r">Pts</th></tr></thead><tbody>
         ${d.breakdown.map((b) => `<tr><td>${esc(STAT_LABELS[b.key] || b.key)} <span class="pmeta">${esc(b.key)}</span></td><td class="r">${b.value}</td><td class="r muted">${b.weight ?? ''}</td><td class="r">${b.points != null ? pts(b.points) : ''}</td></tr>`).join('')}
       </tbody></table></div>` : '<p class="muted">No stats yet this week.</p>'}`;
@@ -356,9 +418,10 @@ async function showPlayer(id) {
 // ------------------------------------------------------------ graveyard / activity
 async function renderGraveyard() {
   const d = await api('/api/graveyard');
+  state.firstWeek = d.first_week || 1;
   $app.innerHTML = `<section class="hero"><h1>The <em>Graveyard</em></h1><p>Every team that lost its head, most recent first.</p></section>
     ${d.teams.length ? `<div class="panel"><ul class="list grave">${d.teams.map((t) => `
-      <li><span class="gw">Week ${t.eliminated_week}</span><span style="flex:1"><a href="#team/${t.id}" class="gname">${esc(t.name)}</a> <span class="muted">${esc(t.owner)}</span></span><span class="num">${t.points != null ? pts(t.points) : ''}</span></li>`).join('')}</ul></div>`
+      <li><span class="gw">Week ${lw(t.eliminated_week)}</span><span style="flex:1"><a href="#team/${t.id}" class="gname">${esc(t.name)}</a> <span class="muted">${esc(t.owner)}</span></span><span class="num">${t.points != null ? pts(t.points) : ''}</span></li>`).join('')}</ul></div>`
     : '<div class="panel"><p>Nobody has been cut yet. The first cut happens after the current week goes final.</p></div>'}`;
 }
 
@@ -391,10 +454,11 @@ async function renderAdmin() {
     throw e;
   }
   const s = d.settings;
+  state.firstWeek = s.first_week || 1;
   const link = (t) => `${location.origin}/#join/${t.token}`;
   $app.innerHTML = `
     <section class="hero"><h1>Commissioner <em>Tools</em></h1>
-      <p>Season ${s.season}, week ${s.current_week}. ${d.player_count} NFL players loaded. ${d.pending_claims} pending bids.
+      <p>Season ${s.season}, league week ${lw(s.current_week)} (NFL week ${s.current_week}). ${d.player_count} NFL players loaded. ${d.pending_claims} pending bids.
       Synced: players ${ago(d.synced.players)}, games ${ago(d.synced.games)}, stats ${ago(d.synced.stats)}.</p></section>
 
     <div class="panel"><h3>Weekly operations</h3>
@@ -403,7 +467,7 @@ async function renderAdmin() {
         <button class="btn" data-op="sync">Sync live stats now</button>
         <button class="btn" data-op="players">Sync NFL player list</button>
         <button class="btn" data-op="waivers">Process waivers now</button>
-        <button class="btn danger" data-op="finalize">Finalize week ${s.current_week} and cut</button>
+        <button class="btn danger" data-op="finalize">Finalize week ${lw(s.current_week)} and cut</button>
         <label class="check"><input type="checkbox" id="force"> Cut even if games aren't final</label>
       </div>
       <div id="op-result"></div>
@@ -422,11 +486,12 @@ async function renderAdmin() {
 
     <div class="panel"><h3>Teams and owner links</h3>
       <p class="muted">Send each owner their private link. Anyone with it can manage that team.</p>
-      <div class="table-wrap"><table><thead><tr><th>Team</th><th>Owner</th><th class="r">FAAB</th><th class="r">Roster</th><th>Status</th><th></th></tr></thead><tbody>
+      <div class="table-wrap"><table><thead><tr><th>Team</th><th>Owner</th><th class="r">FAAB</th><th class="r">Roster</th><th>Status</th><th>Last seen</th><th></th></tr></thead><tbody>
       ${d.teams.map((t) => `<tr><td><a href="#team/${t.id}">${esc(t.name)}</a></td><td>${esc(t.owner)}<div class="pmeta">${esc(t.email || '')}</div></td>
-        <td class="r">$${t.faab}</td><td class="r">${t.roster_size}</td><td>${t.eliminated_week ? `Cut wk ${t.eliminated_week}` : 'Alive'}</td>
+        <td class="r">$${t.faab}</td><td class="r">${t.roster_size}</td><td>${t.eliminated_week ? `Cut wk ${lw(t.eliminated_week)}` : 'Alive'}</td>
+        <td>${isOnline(t.id) ? '<span class="online-chip"><span class="live-dot"></span>Online</span>' : t.last_seen ? `<span class="muted">${ago(t.last_seen)}</span>` : '<span class="muted">Never</span>'}</td>
         <td class="r" style="white-space:nowrap"><button class="btn sm" data-edit="${t.id}">Edit</button> <button class="btn sm" data-copy="${esc(link(t))}">Copy link</button> <button class="btn sm" data-regen="${t.id}">New link</button></td></tr>
-        ${state.editTeam === t.id ? `<tr class="edit-row"><td colspan="6">
+        ${state.editTeam === t.id ? `<tr class="edit-row"><td colspan="7">
           <div class="edit-grid">
             <label>Team name<input id="ed-name" value="${esc(t.name)}"></label>
             <label>Owner<input id="ed-owner" value="${esc(t.owner)}"></label>
@@ -437,12 +502,21 @@ async function renderAdmin() {
             <button class="btn primary sm" data-save-team="${t.id}">Save team</button>
             <button class="btn sm" data-cancel-edit>Cancel</button>
           </div>
-        </td></tr>` : ''}`).join('') || '<tr><td colspan="6" class="muted">No teams yet. Import a CSV above.</td></tr>'}
+          ${t.eliminated_week ? '' : `<div class="cut-box">
+            <h3>Cut this team</h3>
+            <p class="muted">Moves the team to the Graveyard and releases its players to waivers, where owners can bid FAAB on them until waivers run. This can't be undone.</p>
+            <div class="edit-grid">
+              <label>League week cut<input id="cut-week" type="number" min="1" max="18" step="1" value="${Math.max(1, lw(s.current_week) - 1)}"></label>
+              <label>Final score (optional)<input id="cut-points" type="number" step="0.01" placeholder="e.g. 84.36"></label>
+            </div>
+            <div class="toolbar"><button class="btn danger sm" data-cut="${t.id}" data-name="${esc(t.name)}">Cut team</button></div>
+          </div>`}
+        </td></tr>` : ''}`).join('') || '<tr><td colspan="7" class="muted">No teams yet. Import a CSV above.</td></tr>'}
       </tbody></table></div>
     </div>
 
     <div class="panel"><h3>League settings</h3>
-      <p class="muted">Scoring weights use Sleeper stat keys. Set scoring.preset to ppr, half_ppr or std to use standard scoring instead of the weights. Click any player's name to see which stat keys he has. Saving re-pulls this week's stats.</p>
+      <p class="muted">Scoring weights use Sleeper stat keys. Set scoring.preset to ppr, half_ppr or std to use standard scoring instead of the weights. Click any player's name to see which stat keys he has. Set first_week to the NFL week your league counted as Week 1. Saving re-pulls this week's stats.</p>
       <textarea id="settings" rows="22">${esc(JSON.stringify(s, null, 2))}</textarea>
       <div class="toolbar"><button class="btn primary" id="save-settings">Save settings</button></div>
     </div>
@@ -456,7 +530,7 @@ async function renderAdmin() {
   const out = document.getElementById('op-result');
   $app.querySelectorAll('[data-op]').forEach((b) => b.addEventListener('click', async () => {
     const op = b.dataset.op;
-    if (op === 'finalize' && !confirm(`Finalize week ${s.current_week}? The lowest score gets cut and their players go to waivers.`)) return;
+    if (op === 'finalize' && !confirm(`Finalize week ${lw(s.current_week)}? The lowest score gets cut and their players go to waivers.`)) return;
     b.disabled = true;
     out.innerHTML = '<p class="muted">Working</p>';
     try {
@@ -510,6 +584,17 @@ async function renderAdmin() {
       renderAdmin();
     }
   });
+  $app.querySelector('[data-cut]')?.addEventListener('click', async (e) => {
+    const b = e.currentTarget;
+    const leagueWeek = Number(document.getElementById('cut-week').value);
+    if (!Number.isInteger(leagueWeek) || leagueWeek < 1) return toast('Enter the league week the team was cut.', 'error');
+    if (!confirm(`Cut ${b.dataset.name} in week ${leagueWeek} and release their players to waivers? This can't be undone.`)) return;
+    const body = { week: leagueWeek + (s.first_week || 1) - 1, points: document.getElementById('cut-points').value };
+    if (await act(() => api(`/api/admin/teams/${b.dataset.cut}/cut`, { method: 'POST', admin: true, body }), `${b.dataset.name} moved to the Graveyard`)) {
+      state.editTeam = null;
+      renderAdmin();
+    }
+  });
   $app.querySelectorAll('[data-copy]').forEach((b) => b.addEventListener('click', async () => {
     try { await navigator.clipboard.writeText(b.dataset.copy); toast('Link copied'); } catch { prompt('Copy this link', b.dataset.copy); }
   }));
@@ -544,5 +629,5 @@ function adminLogin(msg = '') {
 }
 
 // ------------------------------------------------------------ boot
-window.addEventListener('hashchange', () => { state.openRow = null; router(); });
-loadMe().finally(router);
+window.addEventListener('hashchange', () => { state.openRow = null; router().then(heartbeat); });
+loadMe().finally(() => router().then(heartbeat));

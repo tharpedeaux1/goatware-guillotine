@@ -13,6 +13,12 @@ const state = {
   online: { owners: [], guests: 0 },
   presenceOpen: false,
 };
+// Upcoming bye, in league week numbers. Shows nothing once the bye has passed.
+const byeText = (byes, nfl, currentWeek) => {
+  const w = byes && nfl ? byes[nfl] : null;
+  if (!w || w < currentWeek) return '';
+  return w === currentWeek ? ', <b class="bye-now">bye this week</b>' : `, bye wk ${lw(w)}`;
+};
 // League week number for an NFL week (first_week is the NFL week that was the league's Week 1).
 const lw = (w) => Number(w) - (state.firstWeek || 1) + 1;
 
@@ -73,7 +79,7 @@ function gameText(g) {
   return `${vs} <span class="muted">${res} ${g.team_score}-${g.opp_score}</span>`;
 }
 function eligibleSlots(pos, slots, flex) {
-  return Object.keys(slots).filter((s) => s === 'BN' || (flex[s] ? flex[s].includes(pos) : s === pos));
+  return Object.keys(slots).filter((s) => s === 'BN' || (Number(slots[s]) > 0 && (flex[s] ? flex[s].includes(pos) : s === pos)));
 }
 
 async function loadMe() {
@@ -252,11 +258,8 @@ async function renderLive() {
     </a></li>`;
 
   $app.innerHTML = `
-    <div class="banner-wrap">
-      <img class="banner-bg" src="/banner-1200.jpg" alt="" aria-hidden="true">
-      <img class="banner" src="/banner.jpg" srcset="/banner-1200.jpg 1200w, /banner.jpg 2172w" sizes="(max-width: 700px) 100vw, 562px"
-        width="2172" height="724" alt="Goatware: Fantasy football. Like a GOAT.">
-    </div>
+    <img class="banner" src="/banner-wide.jpg" srcset="/banner-wide-1200.jpg 1200w, /banner-wide.jpg 2400w" sizes="(max-width: 1180px) 100vw, 1124px"
+      width="2400" height="480" alt="Goatware">
     <section class="hero">
       <h1>Week ${lw(d.week)} <em>Chopping Block</em></h1>
       <p>${status}</p>
@@ -295,10 +298,12 @@ async function renderTeam(id) {
   document.title = t.name;
 
   const playerCell = (p) => `<button class="pname" data-player="${esc(p.id)}">${esc(p.name)}</button>${p.injury ? `<span class="inj">${esc(p.injury)}</span>` : ''}
-    <div class="pmeta">${esc(p.pos)} ${esc(p.nfl || 'FA')}${p.locked ? ' <span class="locked">locked</span>' : ''}</div>`;
+    <div class="pmeta">${esc(p.pos)} ${esc(p.nfl || 'FA')}${byeText(d.byes, p.nfl, d.week)}${p.locked ? ' <span class="locked">locked</span>' : ''}</div>
+    <div class="pmeta show-sm">${gameText(p.game)}</div>`;
   const slotCell = (p) => {
     if (!own) return '';
-    const opts = eligibleSlots(p.pos, d.slots, d.flex).map((s) => `<option ${s === p.slot ? 'selected' : ''}>${s}</option>`).join('');
+    const cur = Number(d.slots[p.slot]) > 0 ? p.slot : 'BN';
+    const opts = eligibleSlots(p.pos, d.slots, d.flex).map((s) => `<option ${s === cur ? 'selected' : ''}>${s}</option>`).join('');
     return `<td><select data-slot="${esc(p.id)}" aria-label="Slot for ${esc(p.name)}" ${p.locked ? 'disabled' : ''}>${opts}</select></td>`;
   };
   const dropCell = (p) => (own ? `<td class="r"><button class="btn sm danger" data-drop="${esc(p.id)}" data-name="${esc(p.name)}" ${p.locked ? 'disabled' : ''}>Drop</button></td>` : '');
@@ -306,7 +311,7 @@ async function renderTeam(id) {
       <td class="slot">${esc(slotLabel)}</td>
       <td>${playerCell(p)}</td>
       <td class="hide-sm">${gameText(p.game)}</td>
-      <td class="r pts">${pts(p.points)}</td>
+      <td class="r pts">${pts(p.points)}<div class="pmeta show-sm">proj ${pts(p.proj)}</div></td>
       <td class="r hide-sm muted">${pts(p.proj)}</td>
       ${slotCell(p)}${dropCell(p)}
     </tr>`;
@@ -429,7 +434,7 @@ async function renderPlayers() {
     <div class="table-wrap"><table>
       <thead><tr><th>Player</th><th class="hide-sm">Game</th><th>Status</th><th class="r">Wk ${lw(d.week)}</th><th class="r">Proj</th><th></th></tr></thead>
       <tbody>${d.players.map((p) => `<tr>
-        <td><button class="pname" data-player="${esc(p.id)}">${esc(p.name)}</button>${p.injury ? `<span class="inj">${esc(p.injury)}</span>` : ''}<div class="pmeta">${esc(p.pos)} ${esc(p.nfl || 'FA')}</div></td>
+        <td><button class="pname" data-player="${esc(p.id)}">${esc(p.name)}</button>${p.injury ? `<span class="inj">${esc(p.injury)}</span>` : ''}<div class="pmeta">${esc(p.pos)} ${esc(p.nfl || 'FA')}${byeText(d.byes, p.nfl, d.week)}</div><div class="pmeta show-sm">${gameText(p.game)}</div></td>
         <td class="hide-sm">${gameText(p.game)}</td>
         <td>${statusOf(p)}</td>
         <td class="r pts">${pts(p.points)}</td>
@@ -542,6 +547,9 @@ async function renderAdmin() {
       <div class="toolbar">
         <label class="btn" style="display:inline-flex">Load CSV file<input type="file" id="csv-file" accept=".csv,text/csv" hidden></label>
         <label class="check"><input type="checkbox" id="replace"> Replace all existing teams</label>
+        <label class="check"><input type="checkbox" id="sync"> Sync rosters: make the teams in this file match it exactly</label>
+        <label class="check" id="sync-release-wrap" hidden>Dropped players go to
+          <select id="sync-release"><option value="free_agents">Free agency</option><option value="waivers">Waivers</option></select></label>
         <button class="btn primary" id="do-import">Import</button>
       </div>
       <div id="import-result"></div>
@@ -607,16 +615,54 @@ async function renderAdmin() {
       toast('Done');
       await renderAdmin();
       document.getElementById('op-result').innerHTML = `<pre class="muted" style="white-space:pre-wrap">${esc(JSON.stringify(r, null, 2))}</pre>`;
-    } catch (e) { out.innerHTML = `<p style="color:var(--blood)">${esc(e.message)}</p>`; b.disabled = false; }
+    } catch (e) { out.innerHTML = `<p style="color:var(--wf-red)">${esc(e.message)}</p>`; b.disabled = false; }
   }));
 
   document.getElementById('csv-file').addEventListener('change', async (e) => {
     const f = e.target.files[0];
     if (f) document.getElementById('csv').value = await f.text();
   });
+  const syncBox = document.getElementById('sync');
+  syncBox.addEventListener('change', () => {
+    document.getElementById('sync-release-wrap').hidden = !syncBox.checked;
+    document.getElementById('do-import').textContent = syncBox.checked ? 'Preview changes' : 'Import';
+    if (syncBox.checked) document.getElementById('replace').checked = false;
+  });
+  const runSync = async (csv, preview) => {
+    const res = document.getElementById('import-result');
+    const release = document.getElementById('sync-release').value;
+    res.innerHTML = `<p class="muted">${preview ? 'Comparing rosters' : 'Applying changes'}</p>`;
+    try {
+      const r = await api('/api/admin/import', { method: 'POST', admin: true, body: { csv, sync: true, preview, release } });
+      const total = r.changes.reduce((n, c) => n + c.adds.length + c.removes.length, 0);
+      const blocked = r.unmatched.length || r.problems.some((p) => !p.endsWith('was skipped.'));
+      const pl = (p) => `${esc(p.name)} <span class="pmeta">${esc(p.pos || '')} ${esc(p.nfl || '')}</span>`;
+      const body = `
+        ${r.problems.length ? `<ul style="color:var(--wf-red)">${r.problems.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}
+        ${r.unmatched.length ? `<p style="color:var(--wf-red)">These players didn't match. Add a player_id or nfl_team and try again:</p>
+          <ul>${r.unmatched.map((u) => `<li>${esc(u.team)}: ${esc(u.player)} ${esc(u.pos)} ${esc(u.nfl)}</li>`).join('')}</ul>` : ''}
+        ${r.changes.map((c) => `<div class="sync-team"><h3>${esc(c.team)} <span class="muted" style="font-weight:500">${c.size} players after</span></h3>
+          ${!c.adds.length && !c.removes.length ? '<p class="muted">No changes.</p>' : `<ul class="list">
+            ${c.adds.map((a) => `<li><span><b style="color:var(--wf-green-dark)">Add</b> ${pl(a)}${a.from ? ` <span class="muted">from ${esc(a.from)}</span>` : ''}</span></li>`).join('')}
+            ${c.removes.map((x) => `<li><span><b style="color:var(--wf-red)">Drop</b> ${pl(x)}</span></li>`).join('')}
+          </ul>`}</div>`).join('')}`;
+      if (!preview) {
+        await renderAdmin();
+        document.getElementById('import-result').innerHTML = `<p><b>Done.</b> ${total} roster change${total === 1 ? '' : 's'} applied.</p>${body}`;
+        return;
+      }
+      res.innerHTML = `<p>${total} change${total === 1 ? '' : 's'} across ${r.changes.length} team${r.changes.length === 1 ? '' : 's'}. Nothing has changed yet.</p>${body}
+        ${total && !blocked ? '<div class="toolbar"><button class="btn primary" id="apply-sync">Apply these changes</button></div>' : ''}`;
+      document.getElementById('apply-sync')?.addEventListener('click', () => {
+        if (confirm(`Apply ${total} roster changes?`)) runSync(csv, false);
+      });
+    } catch (e) { res.innerHTML = `<p style="color:var(--wf-red)">${esc(e.message)}</p>`; }
+  };
+
   document.getElementById('do-import').addEventListener('click', async () => {
     const csv = document.getElementById('csv').value.trim();
     if (!csv) return toast('Paste CSV rows or load a file first.', 'error');
+    if (syncBox.checked) return runSync(csv, true);
     const replace = document.getElementById('replace').checked;
     if (replace && !confirm('Replace every existing team and roster?')) return;
     const res = document.getElementById('import-result');
@@ -627,9 +673,9 @@ async function renderAdmin() {
       await renderAdmin();
       document.getElementById('import-result').innerHTML = `
         <p>Imported ${r.teams.length} teams.</p>
-        ${r.unmatched.length ? `<p style="color:var(--blood)">${r.unmatched.length} players didn't match. Add a player_id (Sleeper ID) or nfl_team to these rows and import again:</p>
+        ${r.unmatched.length ? `<p style="color:var(--wf-red)">${r.unmatched.length} players didn't match. Add a player_id (Sleeper ID) or nfl_team to these rows and import again:</p>
           <ul>${r.unmatched.map((u) => `<li>${esc(u.team)}: ${esc(u.player)} ${esc(u.pos)} ${esc(u.nfl)} ${u.note ? `(${esc(u.note)})` : ''}</li>`).join('')}</ul>` : ''}`;
-    } catch (e) { res.innerHTML = `<p style="color:var(--blood)">${esc(e.message)}</p>`; }
+    } catch (e) { res.innerHTML = `<p style="color:var(--wf-red)">${esc(e.message)}</p>`; }
   });
 
   $app.querySelectorAll('[data-edit]').forEach((b) => b.addEventListener('click', () => {
@@ -675,7 +721,16 @@ async function renderAdmin() {
   document.getElementById('save-settings').addEventListener('click', async () => {
     let parsed;
     try { parsed = JSON.parse(document.getElementById('settings').value); } catch (e) { return toast(`Settings aren't valid JSON: ${e.message}`, 'error'); }
-    if (await act(() => api('/api/admin/settings', { method: 'PUT', admin: true, body: { settings: parsed } }), 'Settings saved')) renderAdmin();
+    let r;
+    if (await act(async () => { r = await api('/api/admin/settings', { method: 'PUT', admin: true, body: { settings: parsed } }); }, 'Settings saved')) {
+      await renderAdmin();
+      if (r.benched?.length) {
+        const out = document.getElementById('op-result');
+        out.innerHTML = `<p><b>${r.benched.length} player${r.benched.length === 1 ? '' : 's'} moved to the bench</b> because their lineup slot was removed or has fewer spots now. Let those owners know to reset their lineups:</p>
+          <ul>${r.benched.map((b) => `<li>${esc(b.team)}: ${esc(b.player)} (was ${esc(b.from)})</li>`).join('')}</ul>`;
+        out.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }
   });
   document.getElementById('do-reset').addEventListener('click', async () => {
     const confirmText = document.getElementById('reset-confirm').value;
@@ -742,7 +797,7 @@ function adminLogin(msg = '') {
     <div class="panel"><form id="admin-login" class="inline-form">
       <label>Commissioner key<input type="password" id="admin-key" autocomplete="current-password" required></label>
       <button class="btn primary">Sign in</button></form>
-      ${msg ? `<p style="color:var(--blood)">${esc(msg)}</p>` : ''}</div>`;
+      ${msg ? `<p style="color:var(--wf-red)">${esc(msg)}</p>` : ''}</div>`;
   document.getElementById('admin-login').addEventListener('submit', (e) => {
     e.preventDefault();
     state.adminKey = document.getElementById('admin-key').value;

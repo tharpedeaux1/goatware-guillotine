@@ -204,6 +204,7 @@ async function route(req, env, ctx, url) {
     if (m === 'POST' && (mt = p.match(/^\/api\/admin\/teams\/(\d+)\/cut$/))) return json(await adminCutTeam(env, Number(mt[1]), await body()));
     if (m === 'DELETE' && (mt = p.match(/^\/api\/admin\/teams\/(\d+)\/logo$/))) return json(await saveLogo(env, Number(mt[1]), null));
     if (m === 'POST' && (mt = p.match(/^\/api\/admin\/teams\/(\d+)\/players$/))) return json(await adminAddPlayer(env, Number(mt[1]), await body()));
+    if (m === 'POST' && (mt = p.match(/^\/api\/admin\/teams\/(\d+)\/slot$/))) return json(await adminSetSlot(env, Number(mt[1]), await body()));
     if (m === 'DELETE' && (mt = p.match(/^\/api\/admin\/teams\/(\d+)\/players\/([^/]+)$/))) return json(await adminRemovePlayer(env, Number(mt[1]), decodeURIComponent(mt[2]), url.searchParams.get('to')));
     if (m === 'POST' && p === '/api/admin/reset') return json(await adminReset(env, await body()));
   }
@@ -1184,6 +1185,27 @@ async function normalizeLineups(env, s) {
     await env.DB.batch(moved.slice(i, i + 100).map((m) => env.DB.prepare('UPDATE rosters SET slot = ? WHERE player_id = ?').bind(m.to, m.id)));
   }
   return moved.map(({ player, team, from, to }) => ({ player, team, from, to }));
+}
+
+// Commissioner override: put any player in any slot that exists and has room.
+// Skips game locks, position rules and IR eligibility, but still respects slot sizes.
+async function adminSetSlot(env, teamId, { player_id, slot }) {
+  const s = await getSettings(env);
+  slot = String(slot || '').toUpperCase();
+  if (slot !== 'BN' && !(Number(s.roster_slots[slot]) > 0)) throw new HttpError(400, `There is no ${slot} slot in this league.`);
+  const row = await env.DB.prepare('SELECT r.slot, p.name FROM rosters r LEFT JOIN players p ON p.id = r.player_id WHERE r.team_id = ? AND r.player_id = ?').bind(teamId, player_id).first();
+  if (!row) throw new HttpError(404, 'That player is not on this roster.');
+  if (row.slot === slot) return { ok: true, unchanged: true };
+  if (slot !== 'BN') {
+    const n = (await env.DB.prepare('SELECT COUNT(*) AS n FROM rosters WHERE team_id = ? AND slot = ?').bind(teamId, slot).first()).n;
+    if (n >= Number(s.roster_slots[slot])) throw new HttpError(409, `${slot} is full on this team. Move that player out first.`);
+  }
+  await env.DB.batch([
+    env.DB.prepare('UPDATE rosters SET slot = ? WHERE team_id = ? AND player_id = ?').bind(slot, teamId, player_id),
+    env.DB.prepare("INSERT INTO transactions (week, type, team_id, player_id, detail) VALUES (?, 'lineup', ?, ?, ?)")
+      .bind(s.current_week, teamId, player_id, `Moved from ${row.slot} to ${slot} by the commissioner`),
+  ]);
+  return { ok: true, player: row.name, from: row.slot, to: slot };
 }
 
 const newToken = () => crypto.randomUUID().replace(/-/g, '').slice(0, 24);

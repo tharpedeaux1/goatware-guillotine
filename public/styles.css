@@ -312,3 +312,21 @@ img.avatar { object-fit: cover; background: #fff; }
 @media (max-width: 600px) { .show-sm { display: block; margin-top: 2px; } }
 .over-limit { background: var(--wf-red-wash); color: var(--wf-ink); border: 1px solid rgba(232,83,106,0.35); border-radius: 12px; padding: 12px 16px; margin: 4px 0 8px; font-size: 13.5px; }
 .over-limit b { color: var(--wf-red); }
+
+/* ---------- bids ---------- */
+.bid-count { display: inline-block; margin-top: 3px; font-size: 11px; font-weight: 600; color: var(--wf-gold); background: rgba(154,106,18,0.1); padding: 1px 8px; border-radius: 999px; }
+.my-bid { font-size: 11.5px; font-weight: 600; color: var(--wf-blue-dark); margin-top: 2px; }
+.wr-run summary { cursor: pointer; list-style: none; }
+.wr-run summary::-webkit-details-marker { display: none; }
+.wr-run summary::before { content: "\25B8"; color: var(--wf-ink-soft); margin-right: 8px; display: inline-block; transition: transform .15s; }
+.wr-run[open] summary::before { transform: rotate(90deg); }
+.wr-list { margin-top: 8px; }
+.wr-list li { flex-wrap: wrap; align-items: center; }
+.wr-player { min-width: 200px; }
+.wr-bids { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.wr-bid { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px 3px 3px; border-radius: 999px; border: 1px solid var(--wf-line); background: #fff; font-size: 12px; }
+.wr-bid b { font-variant-numeric: tabular-nums; }
+.wr-bid .tlogo.sm { width: 22px; height: 22px; border-radius: 999px; font-size: 9px; }
+.wr-bid.won { border-color: var(--wf-green); background: rgba(95,168,69,0.1); }
+.wr-bid.won b { color: var(--wf-green-dark); }
+.wr-bid.failed { opacity: .55; text-decoration: line-through; }

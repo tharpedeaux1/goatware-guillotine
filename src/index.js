@@ -12,7 +12,7 @@ const KEEP_KEYS = [
   'pts_ppr', 'pts_half_ppr', 'pts_std', 'gp',
   'pass_att', 'pass_cmp', 'pass_yd', 'pass_td', 'pass_int',
   'rush_att', 'rush_yd', 'rush_td', 'rec_tgt', 'rec', 'rec_yd', 'rec_td', 'fum_lost',
-  'fgm', 'fga', 'xpm', 'xpa', 'sack', 'int', 'fum_rec', 'def_td', 'pts_allow',
+  'fgm', 'fga', 'xpm', 'xpa', 'sack', 'int', 'fum_rec', 'def_td', 'pts_allow', 'yds_allow',
 ];
 
 // Half-PPR defaults using Sleeper stat keys. Edit in Admin > League settings.
@@ -343,7 +343,8 @@ async function syncBlob(env, kind, season, week, s) {
   const res = await fetch(`${SLEEPER}/${path}/nfl/regular/${season}/${week}`, { headers: UA });
   if (!res.ok) throw new Error(`Sleeper ${path} returned ${res.status}`);
   const raw = normalizeStatsPayload(await res.json());
-  const keep = new Set([...KEEP_KEYS, ...Object.keys(s.scoring?.weights || {})]);
+  const keep = new Set([...KEEP_KEYS, ...Object.keys(s.scoring?.weights || {}),
+    ...(s.scoring?.bonuses || []).map((b) => b.stat), ...(s.scoring?.ranges || []).map((r) => r.stat)]);
   const compact = {};
   for (const [pid, st] of Object.entries(raw)) {
     if (!st) continue;
@@ -410,15 +411,32 @@ async function syncLive(env, { force = false } = {}) {
 
 // ---------------------------------------------------------------- scoring
 
+// Custom scoring = per-stat weights, plus optional
+//   bonuses: [{ stat, at, points }]       e.g. +3 when rush_yd reaches 100 (each threshold counts once)
+//   ranges:  [{ stat, min, max, points }] e.g. +7 when a defense allows 0-99 yards
+function scoringLines(st, scoring) {
+  const lines = [];
+  if (!st) return lines;
+  for (const [k, w] of Object.entries(scoring?.weights || {})) {
+    const v = Number(st[k]);
+    if (v && Number(w)) lines.push({ key: k, value: v, weight: Number(w), points: v * Number(w) });
+  }
+  for (const b of scoring?.bonuses || []) {
+    const v = Number(st[b.stat]);
+    if (v >= Number(b.at)) lines.push({ key: `${b.stat} ${b.at}+ bonus`, value: v, weight: null, points: Number(b.points), bonus: true });
+  }
+  for (const r of scoring?.ranges || []) {
+    if (st[r.stat] == null) continue;
+    const v = Number(st[r.stat]);
+    if (v >= Number(r.min) && v <= Number(r.max)) lines.push({ key: `${r.stat} ${r.min}-${r.max}`, value: v, weight: null, points: Number(r.points), bonus: true });
+  }
+  return lines;
+}
+
 function playerPoints(st, scoring) {
   if (!st) return 0;
   if (scoring?.preset && scoring.preset !== 'custom') return round2(st[`pts_${scoring.preset}`]);
-  let pts = 0;
-  for (const [k, w] of Object.entries(scoring?.weights || {})) {
-    const v = Number(st[k]);
-    if (v) pts += v * Number(w);
-  }
-  return round2(pts);
+  return round2(scoringLines(st, scoring).reduce((a, l) => a + l.points, 0));
 }
 
 function gameIndex(games) {
@@ -622,10 +640,11 @@ async function apiPlayer(env, id) {
   ]);
   const st = stats[id] || {};
   const weights = s.scoring?.weights || {};
-  const breakdown = Object.entries(st)
-    .filter(([k]) => !['pts_ppr', 'pts_half_ppr', 'pts_std'].includes(k))
-    .map(([key, value]) => ({ key, value, weight: weights[key] ?? null, points: weights[key] != null ? round2(value * weights[key]) : null }))
-    .sort((a, b) => Math.abs(b.points || 0) - Math.abs(a.points || 0));
+  const scored = scoringLines(st, s.scoring).map((l) => ({ ...l, points: round2(l.points) }));
+  const unscored = Object.entries(st)
+    .filter(([k]) => !['pts_ppr', 'pts_half_ppr', 'pts_std'].includes(k) && !Number(weights[k]))
+    .map(([key, value]) => ({ key, value, weight: null, points: null }));
+  const breakdown = [...scored.sort((a, b) => Math.abs(b.points) - Math.abs(a.points)), ...unscored];
   return {
     week: s.current_week, first_week: s.first_week || 1, preset: s.scoring?.preset || 'custom',
     player: { id: p.id, name: p.name, pos: p.pos, nfl: p.team, injury: p.injury, fantasy_team: p.fantasy_team },
@@ -1014,6 +1033,12 @@ async function adminSettings(env, body) {
   if (!('BN' in next.roster_slots)) throw new HttpError(400, 'roster_slots needs a BN (bench) entry.');
   const weights = next.scoring?.weights || {};
   for (const [k, v] of Object.entries(weights)) if (!Number.isFinite(Number(v))) throw new HttpError(400, `Scoring weight ${k} must be a number.`);
+  for (const b of next.scoring?.bonuses || []) {
+    if (!b.stat || !Number.isFinite(Number(b.at)) || !Number.isFinite(Number(b.points))) throw new HttpError(400, 'Each scoring bonus needs stat, at and points, like {"stat":"rush_yd","at":100,"points":3}.');
+  }
+  for (const r of next.scoring?.ranges || []) {
+    if (!r.stat || !Number.isFinite(Number(r.min)) || !Number.isFinite(Number(r.max)) || !Number.isFinite(Number(r.points))) throw new HttpError(400, 'Each scoring range needs stat, min, max and points, like {"stat":"yds_allow","min":0,"max":99,"points":7}.');
+  }
   await saveSettings(env, next);
   const benched = await normalizeLineups(env, next);
   // Re-pull stats so any newly added scoring keys are captured.

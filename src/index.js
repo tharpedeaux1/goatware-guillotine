@@ -37,6 +37,7 @@ const DEFAULT_SETTINGS = {
   cuts_overrides: {},              // e.g. { "1": 2 } to cut two teams in week 1
   roster_slots: { QB: 1, RB: 2, WR: 2, TE: 1, FLEX: 1, K: 1, DEF: 1, BN: 6 },
   flex_eligibility: { FLEX: ['RB', 'WR', 'TE'], SUPERFLEX: ['QB', 'RB', 'WR', 'TE'] },
+  ir_statuses: ['IR', 'Out', 'PUP', 'NFI', 'COV'], // injury designations allowed in an IR slot
   instant_free_agents: true,       // unrostered players not on waivers can be added immediately
   auto_waivers: true,              // process FAAB claims on the Wednesday cron
   auto_finalize: true,             // run the weekly cut on the Tuesday cron once every game is final
@@ -254,7 +255,10 @@ async function ensureSeasonWeek(env, s) {
   return s;
 }
 
-const rosterMax = (s) => Object.values(s.roster_slots).reduce((a, b) => a + Number(b || 0), 0);
+// Active roster limit: every slot except IR. IR spots are extra and only for injured players.
+const rosterMax = (s) => Object.entries(s.roster_slots).filter(([k]) => k !== 'IR').reduce((a, [, b]) => a + Number(b || 0), 0);
+const irMax = (s) => Number(s.roster_slots.IR || 0);
+const irEligible = (injury, s) => !!injury && (s.ir_statuses || DEFAULT_SETTINGS.ir_statuses).includes(injury);
 const cutsForWeek = (s, week) => Number(s.cuts_overrides?.[week] ?? s.cuts_per_week ?? 1);
 const isStarter = (slot) => slot !== 'BN' && slot !== 'IR';
 
@@ -479,8 +483,8 @@ async function buildWeek(env, s) {
     const t = byId[r.team_id];
     if (!t) continue;
     const pl = decoratePlayer(r, gameBy, stats, proj, s, now);
-    if (isStarter(r.slot) && Number(s.roster_slots[r.slot]) > 0) { t.starters.push(pl); t.points += pl.points; t.projected += pl.projected; }
-    else { t.bench.push(pl); t.bench_points += pl.points; }
+    if (isStarter(r.slot) && Number(s.roster_slots[r.slot]) > 0 && r.slot !== 'IR') { t.starters.push(pl); t.points += pl.points; t.projected += pl.projected; }
+    else { t.bench.push(pl); if (r.slot !== 'IR') t.bench_points += pl.points; }
   }
   for (const t of teams) {
     t.points = round2(t.points); t.projected = round2(t.projected); t.bench_points = round2(t.bench_points);
@@ -547,7 +551,7 @@ async function apiTeam(env, id, req) {
       points: t.points, projected: t.projected, bench_points: t.bench_points, season_total: t.season_total,
     },
     starters: t.starters, bench: t.bench,
-    slots: s.roster_slots, flex: s.flex_eligibility, roster_max: rosterMax(s),
+    slots: s.roster_slots, flex: s.flex_eligibility, roster_max: rosterMax(s), ir_max: irMax(s), ir_statuses: s.ir_statuses || DEFAULT_SETTINGS.ir_statuses,
     history, claims, byes: await getByes(env, wk.season),
   };
 }
@@ -708,7 +712,7 @@ async function onlineSummary(env) {
 // ---------------------------------------------------------------- owner actions
 
 async function teamRoster(env, teamId) {
-  return (await env.DB.prepare(`SELECT r.player_id, r.slot, p.name, p.pos, p.team AS nfl
+  return (await env.DB.prepare(`SELECT r.player_id, r.slot, p.name, p.pos, p.team AS nfl, p.injury
     FROM rosters r LEFT JOIN players p ON p.id = r.player_id WHERE r.team_id = ?`).bind(teamId).all()).results;
 }
 
@@ -726,13 +730,18 @@ async function setLineup(env, team, body) {
     const next = String(desired[r.player_id] ?? r.slot).toUpperCase();
     if (!(Number(s.roster_slots[next]) > 0) && next !== 'BN') throw new HttpError(400, `There is no ${next} slot in this league.`);
     if (next !== r.slot && isLocked(gameBy[r.nfl], now)) throw new HttpError(400, `${r.name} is locked because his game has started.`);
-    if (!eligible(r.pos, next, s)) throw new HttpError(400, `${r.name} (${r.pos}) can't play ${next}.`);
+    if (next === 'IR') {
+      if (next !== r.slot && !irEligible(r.injury, s)) throw new HttpError(400, `${r.name} isn't eligible for IR. Only players listed as ${(s.ir_statuses || DEFAULT_SETTINGS.ir_statuses).join(', ')} can go there.`);
+    } else if (!eligible(r.pos, next, s)) throw new HttpError(400, `${r.name} (${r.pos}) can't play ${next}.`);
     counts[next] = (counts[next] || 0) + 1;
     updates.push(env.DB.prepare('UPDATE rosters SET slot = ? WHERE player_id = ? AND team_id = ?').bind(next, r.player_id, team.id));
   }
   for (const [slot, n] of Object.entries(counts)) {
     if (slot !== 'BN' && n > Number(s.roster_slots[slot])) throw new HttpError(400, `Too many players at ${slot}: ${n} of ${s.roster_slots[slot]}.`);
   }
+  const active = roster.length - (counts.IR || 0);
+  const wasActive = roster.filter((r) => r.slot !== 'IR').length;
+  if (active > rosterMax(s) && active > wasActive) throw new HttpError(400, `That would give you ${active} active players. The limit is ${rosterMax(s)}, so drop someone before activating a player from IR.`);
   if (updates.length) await env.DB.batch(updates);
   return { ok: true, changed: updates.length };
 }
@@ -754,8 +763,13 @@ async function addFreeAgent(env, team, { player_id, drop_player_id }) {
     drop = roster.find((r) => r.player_id === drop_player_id);
     if (!drop) throw new HttpError(400, 'The player you chose to drop is not on your roster.');
     if (isLocked(gameBy[drop.nfl], now)) throw new HttpError(409, `${drop.name} is locked and can't be dropped right now.`);
-  } else if (roster.length >= rosterMax(s)) {
-    throw new HttpError(409, 'Your roster is full. Choose a player to drop.');
+  }
+  const activeNow = roster.filter((r) => r.slot !== 'IR').length;
+  const activeAfter = activeNow + 1 - (drop && drop.slot !== 'IR' ? 1 : 0);
+  if (activeAfter > rosterMax(s)) {
+    throw new HttpError(409, activeNow > rosterMax(s)
+      ? `You have ${activeNow} active players, over the ${rosterMax(s)}-player limit. Drop ${activeNow - rosterMax(s) + 1 - (drop && drop.slot !== 'IR' ? 1 : 0)} more before adding.`
+      : `Your roster is full (${rosterMax(s)} active players). Choose a player to drop.`);
   }
   const stmts = [];
   if (drop) stmts.push(...dropStatements(env, team, drop, s));
@@ -871,10 +885,12 @@ async function processWaivers(env) {
   const s = await getSettings(env);
   const claims = (await env.DB.prepare("SELECT * FROM claims WHERE status = 'pending' ORDER BY created_at, id").all()).results;
   const teams = Object.fromEntries((await env.DB.prepare('SELECT id, name, faab, eliminated_week FROM teams').all()).results.map((t) => [t.id, t]));
-  const owner = Object.fromEntries((await env.DB.prepare('SELECT player_id, team_id FROM rosters').all()).results.map((r) => [r.player_id, r.team_id]));
+  const rosterRows = (await env.DB.prepare('SELECT player_id, team_id, slot FROM rosters').all()).results;
+  const owner = Object.fromEntries(rosterRows.map((r) => [r.player_id, r.team_id]));
+  const onIR = new Set(rosterRows.filter((r) => r.slot === 'IR').map((r) => r.player_id));
   const totals = Object.fromEntries((await env.DB.prepare('SELECT team_id, SUM(points) AS total FROM team_weeks WHERE season = ? GROUP BY team_id').bind(s.season).all()).results.map((r) => [r.team_id, r.total || 0]));
   const counts = {};
-  for (const tid of Object.values(owner)) counts[tid] = (counts[tid] || 0) + 1;
+  for (const r of rosterRows) if (r.slot !== 'IR') counts[r.team_id] = (counts[r.team_id] || 0) + 1; // active players only
   const max = rosterMax(s);
 
   const stmts = [];
@@ -892,7 +908,7 @@ async function processWaivers(env) {
     else if (owner[c.player_id]) reason = 'Player was already claimed';
     else if (c.bid > team.faab) reason = 'Not enough FAAB left';
     else if (c.drop_player_id && owner[c.drop_player_id] !== c.team_id) reason = 'Drop player is no longer on the roster';
-    else if (!c.drop_player_id && (counts[c.team_id] || 0) >= max) reason = 'Roster is full and no drop was chosen';
+    else if ((counts[c.team_id] || 0) + 1 - (c.drop_player_id && !onIR.has(c.drop_player_id) ? 1 : 0) > max) reason = c.drop_player_id ? `Roster would be over the ${max}-player limit` : 'Roster is full and no drop was chosen';
     if (reason) { resolve(c, reason === 'Player was already claimed' ? 'lost' : 'failed', reason); continue; }
 
     team.faab -= c.bid;
@@ -902,7 +918,7 @@ async function processWaivers(env) {
     stmts.push(env.DB.prepare("INSERT INTO transactions (week, type, team_id, player_id, detail) VALUES (?, 'waiver', ?, ?, ?)").bind(s.current_week, c.team_id, c.player_id, `$${c.bid}`));
     if (c.drop_player_id) {
       delete owner[c.drop_player_id];
-      counts[c.team_id] -= 1;
+      if (!onIR.has(c.drop_player_id)) counts[c.team_id] -= 1;
       newlyDropped.push(c.drop_player_id);
       stmts.push(env.DB.prepare('DELETE FROM rosters WHERE player_id = ?').bind(c.drop_player_id));
       stmts.push(env.DB.prepare("INSERT INTO transactions (week, type, team_id, player_id) VALUES (?, 'drop', ?, ?)").bind(s.current_week, c.team_id, c.drop_player_id));
@@ -926,14 +942,15 @@ async function processWaivers(env) {
 async function adminOverview(env) {
   const s = await getSettings(env);
   const teams = (await env.DB.prepare(`SELECT t.id, t.name, t.owner, t.email, t.token, t.faab, t.eliminated_week, t.logo_v,
-      (SELECT COUNT(*) FROM rosters r WHERE r.team_id = t.id) AS roster_size FROM teams t ORDER BY t.name`).all()).results;
+      (SELECT COUNT(*) FROM rosters r WHERE r.team_id = t.id AND r.slot != 'IR') AS roster_size,
+      (SELECT COUNT(*) FROM rosters r WHERE r.team_id = t.id AND r.slot = 'IR') AS ir_size FROM teams t ORDER BY t.name`).all()).results;
   const seen = Object.fromEntries((await env.DB.prepare('SELECT team_id, MAX(last_seen) AS t FROM presence WHERE team_id IS NOT NULL GROUP BY team_id').all()).results.map((r) => [r.team_id, r.t]));
   for (const t of teams) t.last_seen = seen[t.id] || null;
   const playerCount = (await env.DB.prepare('SELECT COUNT(*) AS n FROM players').first()).n;
   const pendingClaims = (await env.DB.prepare("SELECT COUNT(*) AS n FROM claims WHERE status = 'pending'").first()).n;
   const wk = s.season ? `${s.season}:${s.current_week}` : '';
   return {
-    settings: s, teams, player_count: playerCount, pending_claims: pendingClaims,
+    settings: s, teams, roster_max: rosterMax(s), ir_max: irMax(s), player_count: playerCount, pending_claims: pendingClaims,
     synced: {
       players: Number((await getKV(env, 'players_at')) || 0),
       games: Number((await getKV(env, `games_at:${wk}`)) || 0),
@@ -1029,8 +1046,8 @@ async function adminAddPlayer(env, teamId, { player_id, move = false }) {
   const current = await env.DB.prepare('SELECT r.team_id, t.name FROM rosters r JOIN teams t ON t.id = r.team_id WHERE r.player_id = ?').bind(player_id).first();
   if (current && current.team_id === teamId) throw new HttpError(409, `${p.name} is already on ${team.name}.`);
   if (current && !move) throw new HttpError(409, `${p.name} is on ${current.name}. Confirm the move to take him off that roster.`);
-  const count = (await env.DB.prepare('SELECT COUNT(*) AS n FROM rosters WHERE team_id = ?').bind(teamId).first()).n;
-  if (count >= rosterMax(s)) throw new HttpError(409, `${team.name}'s roster is full (${count}/${rosterMax(s)}). Remove a player first.`);
+  const count = (await env.DB.prepare("SELECT COUNT(*) AS n FROM rosters WHERE team_id = ? AND slot != 'IR'").bind(teamId).first()).n;
+  if (count >= rosterMax(s)) throw new HttpError(409, `${team.name} has ${count} active players, and the limit is ${rosterMax(s)}. Remove a player first.`);
   const stmts = [];
   if (current) {
     stmts.push(env.DB.prepare('DELETE FROM rosters WHERE player_id = ?').bind(player_id));
@@ -1101,7 +1118,7 @@ async function adminRosterSync(env, body) {
     const current = rosters.filter((r) => r.team_id === team.id).map((r) => r.player_id);
     const adds = [...want].filter((id) => owner[id] !== team.id);
     const removes = current.filter((id) => !want.has(id));
-    if (want.size > max) problems.push(`${team.name} would have ${want.size} players, over the ${max}-player limit.`);
+    if (want.size > max + irMax(s)) problems.push(`${team.name} would have ${want.size} players, over the ${max} active + ${irMax(s)} IR limit.`);
     changes.push({
       team_id: team.id, team: team.name, size: want.size,
       adds: adds.map((id) => ({ id, name: byId[id]?.name || id, pos: byId[id]?.pos, nfl: byId[id]?.team, from: owner[id] ? teamName[owner[id]] : null })),
@@ -1153,7 +1170,7 @@ async function normalizeLineups(env, s) {
     if ((used[k] || 0) < cap(r.slot)) used[k] = (used[k] || 0) + 1;
     else homeless.push(r);
   }
-  const order = Object.keys(s.roster_slots).filter((k) => k !== 'BN' && cap(k) > 0);
+  const order = Object.keys(s.roster_slots).filter((k) => k !== 'BN' && k !== 'IR' && cap(k) > 0);
   const flexKeys = Object.keys(s.flex_eligibility || {});
   const moved = [];
   for (const r of homeless) {
@@ -1264,7 +1281,7 @@ async function autoLineup(env, teamId, s, proj) {
     .sort((a, b) => b.proj - a.proj);
   const flexKeys = Object.keys(s.flex_eligibility || {});
   const slotList = [];
-  for (const [slot, n] of Object.entries(s.roster_slots)) if (slot !== 'BN' && !flexKeys.includes(slot)) for (let i = 0; i < n; i++) slotList.push(slot);
+  for (const [slot, n] of Object.entries(s.roster_slots)) if (slot !== 'BN' && slot !== 'IR' && !flexKeys.includes(slot)) for (let i = 0; i < n; i++) slotList.push(slot);
   for (const [slot, n] of Object.entries(s.roster_slots)) if (flexKeys.includes(slot)) for (let i = 0; i < n; i++) slotList.push(slot);
   const used = new Set();
   const stmts = [];

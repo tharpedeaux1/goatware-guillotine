@@ -101,6 +101,9 @@ let schemaReady = false;
 async function ensureSchema(env) {
   if (schemaReady) return;
   await env.DB.batch(SCHEMA.map((q) => env.DB.prepare(q))); // all IF NOT EXISTS, so safe to repeat
+  for (const q of ['ALTER TABLE teams ADD COLUMN logo TEXT', 'ALTER TABLE teams ADD COLUMN logo_v INTEGER']) {
+    try { await env.DB.prepare(q).run(); } catch { /* column already exists */ }
+  }
   schemaReady = true;
 }
 
@@ -167,12 +170,15 @@ async function route(req, env, ctx, url) {
   if (m === 'GET' && (mt = p.match(/^\/api\/players\/([^/]+)$/))) return json(await apiPlayer(env, decodeURIComponent(mt[1])));
   if (m === 'GET' && p === '/api/activity') return json(await apiActivity(env));
   if (m === 'POST' && p === '/api/presence') return json(await apiPresence(env, req, await body()));
+  if (m === 'GET' && (mt = p.match(/^\/api\/logos\/(\d+)$/))) return serveLogo(env, Number(mt[1]));
 
   // Team owner (secret link token)
   if (p === '/api/me' || p.startsWith('/api/me/')) {
     const team = await requireOwner(env, req);
     if (m === 'GET' && p === '/api/me') return json({ team: { id: team.id, name: team.name, owner: team.owner, faab: team.faab, eliminated_week: team.eliminated_week } });
     if (m === 'POST' && p === '/api/me/lineup') return json(await setLineup(env, team, await body()));
+    if (m === 'PUT' && p === '/api/me/logo') return json(await saveLogo(env, team.id, (await body()).data));
+    if (m === 'DELETE' && p === '/api/me/logo') return json(await saveLogo(env, team.id, null));
     if (m === 'POST' && p === '/api/me/add') return json(await addFreeAgent(env, team, await body()));
     if (m === 'POST' && p === '/api/me/drop') return json(await dropPlayer(env, team, await body()));
     if (m === 'POST' && p === '/api/me/claims') return json(await createClaim(env, team, await body()));
@@ -195,6 +201,9 @@ async function route(req, env, ctx, url) {
     if (m === 'PUT' && (mt = p.match(/^\/api\/admin\/teams\/(\d+)$/))) return json(await adminUpdateTeam(env, Number(mt[1]), await body()));
     if (m === 'POST' && (mt = p.match(/^\/api\/admin\/teams\/(\d+)\/token$/))) return json(await adminNewToken(env, Number(mt[1])));
     if (m === 'POST' && (mt = p.match(/^\/api\/admin\/teams\/(\d+)\/cut$/))) return json(await adminCutTeam(env, Number(mt[1]), await body()));
+    if (m === 'DELETE' && (mt = p.match(/^\/api\/admin\/teams\/(\d+)\/logo$/))) return json(await saveLogo(env, Number(mt[1]), null));
+    if (m === 'POST' && (mt = p.match(/^\/api\/admin\/teams\/(\d+)\/players$/))) return json(await adminAddPlayer(env, Number(mt[1]), await body()));
+    if (m === 'DELETE' && (mt = p.match(/^\/api\/admin\/teams\/(\d+)\/players\/([^/]+)$/))) return json(await adminRemovePlayer(env, Number(mt[1]), decodeURIComponent(mt[2]), url.searchParams.get('to')));
     if (m === 'POST' && p === '/api/admin/reset') return json(await adminReset(env, await body()));
   }
 
@@ -451,7 +460,7 @@ async function buildWeek(env, s) {
   const { season, current_week: week } = s;
   const now = Date.now();
   const [teamsR, rosterR, games, stats, proj, totalsR] = await Promise.all([
-    env.DB.prepare('SELECT id, name, owner, faab, eliminated_week FROM teams ORDER BY id').all(),
+    env.DB.prepare('SELECT id, name, owner, faab, eliminated_week, logo_v FROM teams ORDER BY id').all(),
     env.DB.prepare(`SELECT r.player_id, r.team_id, r.slot, p.name, p.pos, p.team AS nfl, p.injury
       FROM rosters r LEFT JOIN players p ON p.id = r.player_id`).all(),
     loadGames(env, season, week),
@@ -503,7 +512,7 @@ async function apiLive(env, ctx) {
     stats_updated: Number((await getKV(env, `stats_at:${wk.season}:${wk.week}`)) || 0),
     alive: alive.map((t) => ({
       id: t.id, name: t.name, owner: t.owner, points: t.points, projected: t.projected,
-      season_total: t.season_total, faab: t.faab,
+      season_total: t.season_total, faab: t.faab, logo_v: t.logo_v,
       pips: t.starters.map((p) => p.state),
     })),
     games: wk.games.map((g) => ({
@@ -534,7 +543,7 @@ async function apiTeam(env, id, req) {
   return {
     season: wk.season, week: wk.week, first_week: s.first_week || 1, is_owner,
     team: {
-      id: t.id, name: t.name, owner: t.owner, faab: t.faab, eliminated_week: t.eliminated_week,
+      id: t.id, name: t.name, owner: t.owner, faab: t.faab, eliminated_week: t.eliminated_week, logo_v: t.logo_v,
       points: t.points, projected: t.projected, bench_points: t.bench_points, season_total: t.season_total,
     },
     starters: t.starters, bench: t.bench,
@@ -545,7 +554,7 @@ async function apiTeam(env, id, req) {
 
 async function apiGraveyard(env) {
   const s = await getSettings(env);
-  const r = await env.DB.prepare(`SELECT t.id, t.name, t.owner, t.eliminated_week, tw.points
+  const r = await env.DB.prepare(`SELECT t.id, t.name, t.owner, t.eliminated_week, t.logo_v, tw.points
     FROM teams t LEFT JOIN team_weeks tw ON tw.team_id = t.id AND tw.week = t.eliminated_week AND tw.season = ?
     WHERE t.eliminated_week IS NOT NULL ORDER BY t.eliminated_week DESC, tw.points ASC`).bind(s.season).all();
   return { first_week: s.first_week || 1, teams: r.results };
@@ -612,6 +621,30 @@ async function apiActivity(env) {
   return { items: r.results };
 }
 
+// ---------------------------------------------------------------- team logos
+// Stored as small data URIs (the browser resizes to 256x256 before upload). logo_v busts caches on change.
+
+async function saveLogo(env, teamId, data) {
+  if (data != null) {
+    if (typeof data !== 'string' || !/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(data)) throw new HttpError(400, 'Logos must be PNG, JPG or WebP images.');
+    if (data.length > 300000) throw new HttpError(413, 'That logo is too large. Try a smaller image.');
+  }
+  const r = await env.DB.prepare('UPDATE teams SET logo = ?, logo_v = ? WHERE id = ?').bind(data, data ? Date.now() : null, teamId).run();
+  if (!r.meta.changes) throw new HttpError(404, 'Team not found.');
+  return { ok: true, logo_v: data ? Date.now() : null };
+}
+
+async function serveLogo(env, teamId) {
+  const r = await env.DB.prepare('SELECT logo FROM teams WHERE id = ?').bind(teamId).first();
+  if (!r || !r.logo) return new Response('Not found', { status: 404 });
+  const [head, b64] = r.logo.split(',');
+  const type = head.slice(5, head.indexOf(';'));
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Response(bytes, { headers: { 'content-type': type, 'cache-control': 'public, max-age=31536000, immutable' } });
+}
+
 // ---------------------------------------------------------------- presence
 
 const ONLINE_MS = 2 * 60e3;
@@ -632,13 +665,13 @@ async function apiPresence(env, req, body) {
 
 async function onlineSummary(env) {
   const since = Date.now() - ONLINE_MS;
-  const rows = (await env.DB.prepare(`SELECT p.team_id, p.page, p.last_seen, t.name, t.owner
+  const rows = (await env.DB.prepare(`SELECT p.team_id, p.page, p.last_seen, t.name, t.owner, t.logo_v
     FROM presence p LEFT JOIN teams t ON t.id = p.team_id WHERE p.last_seen > ? ORDER BY p.last_seen DESC`).bind(since).all()).results;
   const owners = new Map();
   let guests = 0;
   for (const r of rows) {
     if (!r.team_id || !r.name) { guests += 1; continue; }
-    if (!owners.has(r.team_id)) owners.set(r.team_id, { team_id: r.team_id, team: r.name, owner: r.owner, page: r.page });
+    if (!owners.has(r.team_id)) owners.set(r.team_id, { team_id: r.team_id, team: r.name, owner: r.owner, page: r.page, logo_v: r.logo_v });
   }
   return { owners: [...owners.values()], guests };
 }
@@ -862,7 +895,7 @@ async function processWaivers(env) {
 
 async function adminOverview(env) {
   const s = await getSettings(env);
-  const teams = (await env.DB.prepare(`SELECT t.id, t.name, t.owner, t.email, t.token, t.faab, t.eliminated_week,
+  const teams = (await env.DB.prepare(`SELECT t.id, t.name, t.owner, t.email, t.token, t.faab, t.eliminated_week, t.logo_v,
       (SELECT COUNT(*) FROM rosters r WHERE r.team_id = t.id) AS roster_size FROM teams t ORDER BY t.name`).all()).results;
   const seen = Object.fromEntries((await env.DB.prepare('SELECT team_id, MAX(last_seen) AS t FROM presence WHERE team_id IS NOT NULL GROUP BY team_id').all()).results.map((r) => [r.team_id, r.t]));
   for (const t of teams) t.last_seen = seen[t.id] || null;
@@ -952,6 +985,52 @@ async function adminCutTeam(env, id, body) {
   const alive = (await env.DB.prepare('SELECT id FROM teams WHERE eliminated_week IS NULL').all()).results;
   if (alive.length === 1) { s.champion_team_id = alive[0].id; await saveSettings(env, s); }
   return { ok: true, team: t.name, week };
+}
+
+// Commissioner roster changes. These skip game locks and waivers because they're corrections.
+async function adminAddPlayer(env, teamId, { player_id, move = false }) {
+  const s = await getSettings(env);
+  const team = await env.DB.prepare('SELECT * FROM teams WHERE id = ?').bind(teamId).first();
+  if (!team) throw new HttpError(404, 'Team not found.');
+  if (team.eliminated_week) throw new HttpError(409, `${team.name} has been cut.`);
+  const p = await env.DB.prepare('SELECT * FROM players WHERE id = ?').bind(player_id).first();
+  if (!p) throw new HttpError(404, 'Player not found.');
+  const current = await env.DB.prepare('SELECT r.team_id, t.name FROM rosters r JOIN teams t ON t.id = r.team_id WHERE r.player_id = ?').bind(player_id).first();
+  if (current && current.team_id === teamId) throw new HttpError(409, `${p.name} is already on ${team.name}.`);
+  if (current && !move) throw new HttpError(409, `${p.name} is on ${current.name}. Confirm the move to take him off that roster.`);
+  const count = (await env.DB.prepare('SELECT COUNT(*) AS n FROM rosters WHERE team_id = ?').bind(teamId).first()).n;
+  if (count >= rosterMax(s)) throw new HttpError(409, `${team.name}'s roster is full (${count}/${rosterMax(s)}). Remove a player first.`);
+  const stmts = [];
+  if (current) {
+    stmts.push(env.DB.prepare('DELETE FROM rosters WHERE player_id = ?').bind(player_id));
+    stmts.push(env.DB.prepare("INSERT INTO transactions (week, type, team_id, player_id, detail) VALUES (?, 'drop', ?, ?, ?)")
+      .bind(s.current_week, current.team_id, player_id, `Moved to ${team.name} by the commissioner`));
+  }
+  stmts.push(env.DB.prepare("INSERT INTO rosters (player_id, team_id, slot) VALUES (?, ?, 'BN')").bind(player_id, teamId));
+  stmts.push(env.DB.prepare('DELETE FROM waiver_wire WHERE player_id = ?').bind(player_id));
+  stmts.push(env.DB.prepare("UPDATE claims SET status = 'failed', reason = 'Added to a roster by the commissioner', processed_at = datetime('now') WHERE player_id = ? AND status = 'pending'").bind(player_id));
+  stmts.push(env.DB.prepare("INSERT INTO transactions (week, type, team_id, player_id, detail) VALUES (?, 'add', ?, ?, 'Added by the commissioner')")
+    .bind(s.current_week, teamId, player_id));
+  await env.DB.batch(stmts);
+  return { ok: true, player: p.name, team: team.name, moved_from: current ? current.name : null };
+}
+
+async function adminRemovePlayer(env, teamId, playerId, to) {
+  const s = await getSettings(env);
+  const row = await env.DB.prepare('SELECT r.player_id, p.name FROM rosters r LEFT JOIN players p ON p.id = r.player_id WHERE r.team_id = ? AND r.player_id = ?')
+    .bind(teamId, playerId).first();
+  if (!row) throw new HttpError(404, 'That player is not on this roster.');
+  const toWaivers = to !== 'free_agents';
+  const stmts = [
+    env.DB.prepare('DELETE FROM rosters WHERE player_id = ? AND team_id = ?').bind(playerId, teamId),
+    toWaivers
+      ? env.DB.prepare('INSERT OR IGNORE INTO waiver_wire (player_id) VALUES (?)').bind(playerId)
+      : env.DB.prepare('DELETE FROM waiver_wire WHERE player_id = ?').bind(playerId),
+    env.DB.prepare("INSERT INTO transactions (week, type, team_id, player_id, detail) VALUES (?, 'drop', ?, ?, ?)")
+      .bind(s.current_week, teamId, playerId, `Removed by the commissioner, to ${toWaivers ? 'waivers' : 'free agency'}`),
+  ];
+  await env.DB.batch(stmts);
+  return { ok: true, player: row.name || playerId, to: toWaivers ? 'waivers' : 'free_agents' };
 }
 
 const newToken = () => crypto.randomUUID().replace(/-/g, '').slice(0, 24);

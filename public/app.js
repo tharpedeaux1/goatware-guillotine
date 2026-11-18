@@ -363,7 +363,7 @@ async function renderTeam(id) {
     ${own ? `<div class="toolbar"><button class="btn primary" id="save-lineup">Save lineup</button><a class="btn" href="#players">Find players</a></div>` : ''}`}
     ${own && d.claims.length ? `<h2>Your waiver bids</h2><div class="panel"><ul class="list">${d.claims.map((c) => `
       <li><span><b>${esc(c.player)}</b> <span class="muted">${esc(c.pos)} ${esc(c.nfl || '')}</span> for <b>$${c.bid}</b>${c.drop_name ? `, dropping ${esc(c.drop_name)}` : ''}
-        <div class="pmeta">${c.status === 'pending' ? 'Pending until waivers run Wednesday' : esc(c.reason || c.status)}</div></span>
+        <div class="pmeta">${c.status === 'pending' ? `Pending until waivers run Wednesday${c.other_bids ? `. ${c.other_bids} other bid${c.other_bids > 1 ? 's' : ''}` : ''}` : `${esc(c.reason || c.status)}${c.status === 'lost' && c.winning_bid != null ? ` for $${c.winning_bid}` : ''}`}</div></span>
         ${c.status === 'pending' ? `<button class="btn sm" data-cancel="${c.id}">Cancel bid</button>` : `<span class="muted">${esc(c.status)}</span>`}
       </li>`).join('')}</ul></div>` : ''}
     ${d.history.length ? `<h2>Weekly results</h2><div class="panel"><ul class="list">${d.history.map((h) => `
@@ -415,19 +415,34 @@ async function renderPlayers() {
   const dropOptions = `<option value="">No drop</option>${myRoster.map((p) => `<option value="${esc(p.id)}" ${p.locked ? 'disabled' : ''}>${esc(p.name)} (${esc(p.pos)})${p.locked ? ' locked' : ''}</option>`).join('')}`;
   const canAct = !!mine;
 
-  const statusOf = (p) => (p.fantasy_team ? esc(p.fantasy_team) : p.on_waivers || !d.instant_free_agents ? 'Waivers' : 'Free agent');
+  // Bid counts never reveal who bid or how much; for an owner they count other teams only.
+  const bidCount = (p) => {
+    if (!p.other_bids) return '';
+    const n = p.other_bids;
+    return `<div class="bid-count">${n} ${canAct ? 'other ' : ''}bid${n > 1 ? 's' : ''}</div>`;
+  };
+  const statusOf = (p) => {
+    if (p.fantasy_team) return esc(p.fantasy_team);
+    const base = p.on_waivers || !d.instant_free_agents ? 'Waivers' : 'Free agent';
+    const mineTxt = p.my_bid ? `<div class="my-bid">Your bid $${p.my_bid.bid}${p.my_bid.drop_name ? `, dropping ${esc(p.my_bid.drop_name)}` : ''}</div>` : '';
+    return `${base}${mineTxt}${bidCount(p)}`;
+  };
   const actionOf = (p) => {
     if (!canAct || p.fantasy_team) return '';
     const waiver = p.on_waivers || !d.instant_free_agents;
+    if (p.my_bid) return `<button class="btn sm" data-open="${esc(p.id)}">Edit bid</button>`;
     return `<button class="btn sm" data-open="${esc(p.id)}" ${!waiver && p.locked ? 'disabled title="Game has started"' : ''}>${waiver ? 'Bid' : 'Add'}</button>`;
   };
   const formRow = (p) => {
-    const waiver = p.on_waivers || !d.instant_free_agents;
+    const waiver = p.on_waivers || !d.instant_free_agents || !!p.my_bid;
+    const mb = p.my_bid;
+    const drops = mb ? dropOptions.replace(`value="${esc(mb.drop_player_id || '')}"`, `value="${esc(mb.drop_player_id || '')}" selected`) : dropOptions;
     return `<tr class="form-row"><td colspan="6"><div class="inline-form">
-      ${waiver ? `<label>Bid (you have $${mine.team.faab})<input type="number" min="0" max="${mine.team.faab}" step="1" value="0" id="bid-amt" style="width:110px"></label>` : ''}
-      <label>Drop<select id="bid-drop">${dropOptions}</select></label>
-      <button class="btn primary" data-submit="${esc(p.id)}" data-waiver="${waiver ? 1 : 0}" data-name="${esc(p.name)}">${waiver ? 'Place bid' : 'Add player'}</button>
-      <button class="btn" data-close>Cancel</button>
+      ${waiver ? `<label>${mb ? 'Change your bid' : 'Bid'} (you have $${mine.team.faab})<input type="number" min="0" max="${mine.team.faab}" step="1" value="${mb ? mb.bid : 0}" id="bid-amt" style="width:110px"></label>` : ''}
+      <label>Drop<select id="bid-drop">${drops}</select></label>
+      <button class="btn primary" data-submit="${esc(p.id)}" data-waiver="${waiver ? 1 : 0}" data-name="${esc(p.name)}" data-editing="${mb ? 1 : 0}">${mb ? 'Update bid' : waiver ? 'Place bid' : 'Add player'}</button>
+      ${mb ? `<button class="btn danger" data-cancel-bid="${mb.id}" data-name="${esc(p.name)}">Cancel bid</button>` : ''}
+      <button class="btn" data-close>Close</button>
     </div></td></tr>`;
   };
 
@@ -464,9 +479,14 @@ async function renderPlayers() {
     const b = e.currentTarget;
     const drop = document.getElementById('bid-drop').value || null;
     const ok = b.dataset.waiver === '1'
-      ? await act(() => api('/api/me/claims', { method: 'POST', body: { player_id: b.dataset.submit, drop_player_id: drop, bid: Number(document.getElementById('bid-amt').value) } }), `Bid placed on ${b.dataset.name}`)
+      ? await act(() => api('/api/me/claims', { method: 'POST', body: { player_id: b.dataset.submit, drop_player_id: drop, bid: Number(document.getElementById('bid-amt').value) } }), b.dataset.editing === '1' ? `Bid on ${b.dataset.name} updated` : `Bid placed on ${b.dataset.name}`)
       : await act(() => api('/api/me/add', { method: 'POST', body: { player_id: b.dataset.submit, drop_player_id: drop } }), `${b.dataset.name} added`);
     if (ok) { state.openRow = null; await loadMe(); renderPlayers(); }
+  });
+  $app.querySelector('[data-cancel-bid]')?.addEventListener('click', async (e) => {
+    const b = e.currentTarget;
+    if (!confirm(`Cancel your bid on ${b.dataset.name}?`)) return;
+    if (await act(() => api(`/api/me/claims/${b.dataset.cancelBid}`, { method: 'DELETE' }), 'Bid canceled')) { state.openRow = null; renderPlayers(); }
   });
 }
 
@@ -503,9 +523,21 @@ async function renderGraveyard() {
 }
 
 async function renderActivity() {
-  const d = await api('/api/activity');
+  const [d, w] = await Promise.all([api('/api/activity'), api('/api/waivers/results')]);
+  state.firstWeek = w.first_week || 1;
+  const runDate = (id) => new Date(id).toLocaleString([], { weekday: 'long', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  const resultsHtml = w.runs.length ? w.runs.map((run, i) => `
+    <details class="panel wr-run" ${i === 0 ? 'open' : ''}>
+      <summary><h3 style="display:inline">Waiver results</h3> <span class="muted">${runDate(run.run_id)}, ${run.players.length} player${run.players.length === 1 ? '' : 's'}</span></summary>
+      <ul class="list wr-list">${run.players.map((pl) => `<li>
+        <div class="wr-player"><b>${esc(pl.player)}</b> <span class="pmeta">${esc(pl.pos || '')} ${esc(pl.nfl || '')}</span>
+          <div class="pmeta">${pl.winner ? `Won by <b>${esc(pl.winner.team)}</b> for $${pl.winner.bid}` : 'Not awarded'}</div></div>
+        <div class="wr-bids">${pl.bids.map((b) => `<span class="wr-bid ${b.status}" title="${esc(b.reason || '')}">${teamLogo(b.team_id, b.logo_v, b.team, 'sm')}<span>${esc(b.team)}</span><b>$${b.bid}</b></span>`).join('')}</div>
+      </li>`).join('')}</ul>
+    </details>`).join('') : '';
   const label = { add: 'Added', drop: 'Dropped', waiver: 'Won on waivers', eliminated: 'Cut', import: 'League import', lineup: 'Lineup change:' };
-  $app.innerHTML = `<section class="hero"><h1>League <em>Activity</em></h1><p>Adds, drops, waiver wins and cuts.</p></section>
+  $app.innerHTML = `<section class="hero"><h1>League <em>Activity</em></h1><p>Adds, drops, waiver wins and cuts. Waiver bids are revealed here after each Wednesday run.</p></section>
+    ${resultsHtml}
     ${d.items.length ? `<div class="panel"><ul class="list">${d.items.map((x) => `
       <li><span><b>${esc(x.team || 'League')}</b> ${esc(label[x.type] || x.type)} ${x.player ? `<b>${esc(x.player)}</b> <span class="muted">${esc(x.pos || '')}</span>` : ''} ${x.detail ? `<span class="muted">${esc(x.detail)}</span>` : ''}</span>
       <span class="muted" style="white-space:nowrap">${new Date(`${x.created_at.replace(' ', 'T')}Z`).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</span></li>`).join('')}</ul></div>`

@@ -479,7 +479,7 @@ async function buildWeek(env, s) {
     const t = byId[r.team_id];
     if (!t) continue;
     const pl = decoratePlayer(r, gameBy, stats, proj, s, now);
-    if (isStarter(r.slot)) { t.starters.push(pl); t.points += pl.points; t.projected += pl.projected; }
+    if (isStarter(r.slot) && Number(s.roster_slots[r.slot]) > 0) { t.starters.push(pl); t.points += pl.points; t.projected += pl.projected; }
     else { t.bench.push(pl); t.bench_points += pl.points; }
   }
   for (const t of teams) {
@@ -548,7 +548,7 @@ async function apiTeam(env, id, req) {
     },
     starters: t.starters, bench: t.bench,
     slots: s.roster_slots, flex: s.flex_eligibility, roster_max: rosterMax(s),
-    history, claims,
+    history, claims, byes: await getByes(env, wk.season),
   };
 }
 
@@ -589,7 +589,7 @@ async function apiPlayers(env, url) {
       locked: isLocked(g, now), game: gameFor(g, r.nfl), state: g ? g.state : 'bye',
     };
   }).sort((a, b) => b.proj - a.proj || b.points - a.points).slice(0, 150);
-  return { week: s.current_week, first_week: s.first_week || 1, instant_free_agents: s.instant_free_agents, players };
+  return { week: s.current_week, first_week: s.first_week || 1, instant_free_agents: s.instant_free_agents, players, byes: await getByes(env, s.season) };
 }
 
 async function apiPlayer(env, id) {
@@ -619,6 +619,35 @@ async function apiActivity(env) {
     FROM transactions x LEFT JOIN teams t ON t.id = x.team_id LEFT JOIN players p ON p.id = x.player_id
     ORDER BY x.id DESC LIMIT 150`).all();
   return { items: r.results };
+}
+
+// ---------------------------------------------------------------- bye weeks
+// One small Sleeper schedule file per season gives every team's bye week (NFL week numbers).
+async function getByes(env, season) {
+  const raw = await getKV(env, `byes:${season}`);
+  if (raw) {
+    const saved = JSON.parse(raw);
+    if (Date.now() - saved.at < 7 * 86400e3) return saved.byes;
+  }
+  try {
+    const res = await fetch(`https://api.sleeper.app/schedule/nfl/regular/${season}`, { headers: UA });
+    if (!res.ok) throw new Error(`Sleeper schedule returned ${res.status}`);
+    const games = await res.json();
+    const played = {};
+    for (const g of games) for (const t of [g.home, g.away]) {
+      const team = normTeam(t);
+      (played[team] = played[team] || new Set()).add(Number(g.week));
+    }
+    const byes = {};
+    for (const [team, weeks] of Object.entries(played)) {
+      for (let w = 1; w <= 18; w++) if (!weeks.has(w)) { byes[team] = w; break; }
+    }
+    await setKV(env, `byes:${season}`, JSON.stringify({ at: Date.now(), byes }));
+    return byes;
+  } catch (e) {
+    console.error(e);
+    return raw ? JSON.parse(raw).byes : {};
+  }
 }
 
 // ---------------------------------------------------------------- team logos
@@ -693,12 +722,13 @@ async function setLineup(env, team, body) {
   const counts = {};
   const updates = [];
   for (const r of roster) {
+    if (!(Number(s.roster_slots[r.slot]) > 0)) r.slot = 'BN'; // slot was removed in settings
     const next = String(desired[r.player_id] ?? r.slot).toUpperCase();
-    if (!(next in s.roster_slots)) throw new HttpError(400, `There is no ${next} slot in this league.`);
+    if (!(Number(s.roster_slots[next]) > 0) && next !== 'BN') throw new HttpError(400, `There is no ${next} slot in this league.`);
     if (next !== r.slot && isLocked(gameBy[r.nfl], now)) throw new HttpError(400, `${r.name} is locked because his game has started.`);
     if (!eligible(r.pos, next, s)) throw new HttpError(400, `${r.name} (${r.pos}) can't play ${next}.`);
     counts[next] = (counts[next] || 0) + 1;
-    if (next !== r.slot) updates.push(env.DB.prepare('UPDATE rosters SET slot = ? WHERE player_id = ? AND team_id = ?').bind(next, r.player_id, team.id));
+    updates.push(env.DB.prepare('UPDATE rosters SET slot = ? WHERE player_id = ? AND team_id = ?').bind(next, r.player_id, team.id));
   }
   for (const [slot, n] of Object.entries(counts)) {
     if (slot !== 'BN' && n > Number(s.roster_slots[slot])) throw new HttpError(400, `Too many players at ${slot}: ${n} of ${s.roster_slots[slot]}.`);
@@ -929,10 +959,11 @@ async function adminSettings(env, body) {
   const weights = next.scoring?.weights || {};
   for (const [k, v] of Object.entries(weights)) if (!Number.isFinite(Number(v))) throw new HttpError(400, `Scoring weight ${k} must be a number.`);
   await saveSettings(env, next);
+  const benched = await normalizeLineups(env, next);
   // Re-pull stats so any newly added scoring keys are captured.
   let sync = null;
   try { sync = await syncLive(env, { force: true }); } catch (e) { sync = { error: e.message }; }
-  return { ok: true, settings: next, sync };
+  return { ok: true, settings: next, sync, benched };
 }
 
 async function adminUpdateTeam(env, id, body) {
@@ -1031,6 +1062,111 @@ async function adminRemovePlayer(env, teamId, playerId, to) {
   ];
   await env.DB.batch(stmts);
   return { ok: true, player: row.name || playerId, to: toWaivers ? 'waivers' : 'free_agents' };
+}
+
+// Make the rosters of the teams in a CSV match it exactly. Other teams are untouched.
+// Kept players keep their lineup slot; new players go to the bench; players not listed are released.
+// body: { csv, preview: bool, release: 'free_agents' | 'waivers' }
+async function adminRosterSync(env, body) {
+  const incoming = csvToTeams(body.csv || '');
+  if (!incoming.length) throw new HttpError(400, 'Nothing to sync. Paste CSV rows first.');
+  const s = await getSettings(env);
+  const toWaivers = body.release === 'waivers';
+  const all = (await env.DB.prepare('SELECT id, name, pos, team FROM players').all()).results;
+  const byId = Object.fromEntries(all.map((p) => [p.id, p]));
+  const idx = new Map();
+  for (const p of all) { const k = normName(p.name); if (!idx.has(k)) idx.set(k, []); idx.get(k).push(p); }
+  const teams = (await env.DB.prepare('SELECT id, name, eliminated_week FROM teams').all()).results;
+  const rosters = (await env.DB.prepare('SELECT player_id, team_id FROM rosters').all()).results;
+  const owner = Object.fromEntries(rosters.map((r) => [r.player_id, r.team_id]));
+  const teamName = Object.fromEntries(teams.map((t) => [t.id, t.name]));
+  const max = rosterMax(s);
+
+  const changes = [];
+  const unmatched = [];
+  const problems = [];
+  const listed = new Map(); // player id -> team name in the CSV
+  for (const t of incoming) {
+    const team = teams.find((x) => x.name.toLowerCase() === String(t.name).toLowerCase());
+    if (!team) { problems.push(`"${t.name}" isn't a team in the league. Check the spelling.`); continue; }
+    if (team.eliminated_week) { problems.push(`${team.name} has been cut, so it was skipped.`); continue; }
+    const want = new Set();
+    for (const pl of t.players || []) {
+      const m = matchPlayer(pl, all, idx, byId);
+      if (!m) { unmatched.push({ team: t.name, player: pl.name || pl.id, pos: pl.pos || '', nfl: pl.team || '' }); continue; }
+      if (listed.has(m.id)) { problems.push(`${m.name} is listed on both ${listed.get(m.id)} and ${team.name}.`); continue; }
+      listed.set(m.id, team.name);
+      want.add(m.id);
+    }
+    const current = rosters.filter((r) => r.team_id === team.id).map((r) => r.player_id);
+    const adds = [...want].filter((id) => owner[id] !== team.id);
+    const removes = current.filter((id) => !want.has(id));
+    if (want.size > max) problems.push(`${team.name} would have ${want.size} players, over the ${max}-player limit.`);
+    changes.push({
+      team_id: team.id, team: team.name, size: want.size,
+      adds: adds.map((id) => ({ id, name: byId[id]?.name || id, pos: byId[id]?.pos, nfl: byId[id]?.team, from: owner[id] ? teamName[owner[id]] : null })),
+      removes: removes.map((id) => ({ id, name: byId[id]?.name || id, pos: byId[id]?.pos, nfl: byId[id]?.team })),
+    });
+  }
+  // A player moving to a team in this file from a team not in this file is fine; one leaving a synced team is handled there.
+  if (body.preview || unmatched.length || problems.some((p) => !p.endsWith('was skipped.'))) {
+    return { ok: true, preview: true, applied: false, changes, unmatched, problems };
+  }
+
+  const stmts = [];
+  const log = (type, teamId, pid, detail) => stmts.push(env.DB.prepare('INSERT INTO transactions (week, type, team_id, player_id, detail) VALUES (?, ?, ?, ?, ?)').bind(s.current_week, type, teamId, pid, detail));
+  for (const c of changes) {
+    for (const r of c.removes) {
+      if (listed.has(r.id)) continue; // moving to another team in this file; the add below handles it
+      stmts.push(env.DB.prepare('DELETE FROM rosters WHERE player_id = ? AND team_id = ?').bind(r.id, c.team_id));
+      stmts.push(toWaivers
+        ? env.DB.prepare('INSERT OR IGNORE INTO waiver_wire (player_id) VALUES (?)').bind(r.id)
+        : env.DB.prepare('DELETE FROM waiver_wire WHERE player_id = ?').bind(r.id));
+      log('drop', c.team_id, r.id, `Roster sync, to ${toWaivers ? 'waivers' : 'free agency'}`);
+    }
+  }
+  for (const c of changes) {
+    for (const a of c.adds) {
+      if (owner[a.id]) log('drop', owner[a.id], a.id, `Moved to ${c.team} by roster sync`);
+      stmts.push(env.DB.prepare(`INSERT INTO rosters (player_id, team_id, slot) VALUES (?, ?, 'BN')
+        ON CONFLICT(player_id) DO UPDATE SET team_id = excluded.team_id, slot = 'BN'`).bind(a.id, c.team_id));
+      stmts.push(env.DB.prepare('DELETE FROM waiver_wire WHERE player_id = ?').bind(a.id));
+      stmts.push(env.DB.prepare("UPDATE claims SET status = 'failed', reason = 'Added to a roster by the commissioner', processed_at = datetime('now') WHERE player_id = ? AND status = 'pending'").bind(a.id));
+      log('add', c.team_id, a.id, 'Roster sync');
+    }
+  }
+  if (stmts.length) await env.DB.batch(stmts);
+  return { ok: true, preview: false, applied: true, changes, unmatched, problems };
+}
+
+// When lineup slots change, players whose slot was removed or overfilled move to another open slot
+// they qualify for (their own position first, then flex slots). Only if nothing fits do they go to the bench.
+async function normalizeLineups(env, s) {
+  const rows = (await env.DB.prepare(`SELECT r.player_id, r.team_id, r.slot, p.name, p.pos, t.name AS team FROM rosters r
+    LEFT JOIN players p ON p.id = r.player_id LEFT JOIN teams t ON t.id = r.team_id
+    WHERE r.slot NOT IN ('BN', 'IR') ORDER BY r.team_id, r.acquired_at`).all()).results;
+  const cap = (slot) => Number(s.roster_slots[slot] || 0);
+  const used = {};
+  const homeless = [];
+  for (const r of rows) {
+    const k = `${r.team_id}:${r.slot}`;
+    if ((used[k] || 0) < cap(r.slot)) used[k] = (used[k] || 0) + 1;
+    else homeless.push(r);
+  }
+  const order = Object.keys(s.roster_slots).filter((k) => k !== 'BN' && cap(k) > 0);
+  const flexKeys = Object.keys(s.flex_eligibility || {});
+  const moved = [];
+  for (const r of homeless) {
+    const options = [...order.filter((k) => !flexKeys.includes(k)), ...order.filter((k) => flexKeys.includes(k))]
+      .filter((k) => eligible(r.pos, k, s));
+    const to = options.find((k) => (used[`${r.team_id}:${k}`] || 0) < cap(k)) || 'BN';
+    if (to !== 'BN') used[`${r.team_id}:${to}`] = (used[`${r.team_id}:${to}`] || 0) + 1;
+    moved.push({ id: r.player_id, player: r.name, team: r.team, from: r.slot, to });
+  }
+  for (let i = 0; i < moved.length; i += 100) {
+    await env.DB.batch(moved.slice(i, i + 100).map((m) => env.DB.prepare('UPDATE rosters SET slot = ? WHERE player_id = ?').bind(m.to, m.id)));
+  }
+  return moved.map(({ player, team, from, to }) => ({ player, team, from, to }));
 }
 
 const newToken = () => crypto.randomUUID().replace(/-/g, '').slice(0, 24);
@@ -1142,6 +1278,7 @@ async function autoLineup(env, teamId, s, proj) {
 }
 
 async function adminImport(env, body) {
+  if (body.sync) return adminRosterSync(env, body);
   const incoming = body.csv ? csvToTeams(body.csv) : body.teams;
   if (!Array.isArray(incoming) || !incoming.length) throw new HttpError(400, 'Nothing to import. Paste CSV rows or send a teams array.');
   if (!(await env.DB.prepare('SELECT COUNT(*) AS n FROM players').first()).n) throw new HttpError(409, 'Load the NFL player list first (Commissioner > Sync NFL player list).');

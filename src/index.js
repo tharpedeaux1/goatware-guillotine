@@ -154,7 +154,8 @@ async function tick(env) {
 
   // Season points: score one past week per run, then add them up.
   if (await seasonPointsStep(env, s)) return;
-  // Keep rostered players' news fresh, a few players per run.
+  // Map ESPN player IDs from team rosters (one team per run), then keep rostered players' news fresh.
+  if (await espnRosterStep(env)) return;
   await newsStep(env, 4);
 
   // Forget devices not seen in 30 days.
@@ -188,7 +189,7 @@ async function route(req, env, ctx, url) {
   if (m === 'GET' && p === '/api/graveyard') return json(await apiGraveyard(env));
   if (m === 'GET' && p === '/api/players') return json(await apiPlayers(env, url, req));
   if (m === 'GET' && p === '/api/waivers/results') return json(await apiWaiverResults(env));
-  if (m === 'GET' && (mt = p.match(/^\/api\/players\/([^/]+)\/news$/))) return json(await apiPlayerNews(env, decodeURIComponent(mt[1]), url.searchParams.get('debug') === '1'));
+  if (m === 'GET' && (mt = p.match(/^\/api\/players\/([^/]+)\/news$/))) return json(await apiPlayerNews(env, decodeURIComponent(mt[1]), url.searchParams.get('espn') || url.searchParams.get('debug') === '1'));
   if (m === 'GET' && (mt = p.match(/^\/api\/teams\/(\d+)\/news$/))) return json(await apiTeamNews(env, Number(mt[1])));
   if (m === 'GET' && (mt = p.match(/^\/api\/players\/([^/]+)$/))) return json(await apiPlayer(env, decodeURIComponent(mt[1])));
   if (m === 'GET' && p === '/api/activity') return json(await apiActivity(env));
@@ -787,30 +788,43 @@ const ESPN_HEADERS = {
   Accept: 'application/json',
 };
 
-// Only remembers "no ESPN player" when ESPN actually answered; errors are retried next time.
+// ESPN IDs come from ESPN's team rosters (espnRosterStep). ESPN's search API refuses requests from Cloudflare.
 async function resolveEspnId(env, p, diag) {
-  if (p.espn_id) return p.espn_id === 'none' ? null : p.espn_id;
-  if (p.pos === 'DEF') return null;
-  try {
-    const res = await fetch(`https://site.web.api.espn.com/apis/common/v3/search?query=${encodeURIComponent(p.name)}&limit=8&type=player`, { headers: ESPN_HEADERS });
-    if (diag) diag.search_status = res.status;
-    if (!res.ok) return null;
-    const items = ((await res.json()).items || []).filter((it) => it.league === 'nfl');
-    if (diag) diag.search_results = items.length;
-    const exact = items.find((it) => normName(it.displayName) === normName(p.name));
-    const id = (exact || items[0])?.id || null;
-    await env.DB.prepare('UPDATE players SET espn_id = ? WHERE id = ?').bind(id || 'none', p.id).run();
-    return id;
-  } catch (e) {
-    if (diag) diag.search_error = String(e.message || e);
-    return null;
+  if (diag) diag.stored_espn_id = p.espn_id || null;
+  return p.espn_id && p.espn_id !== 'none' ? p.espn_id : null;
+}
+
+// Map ESPN IDs for one NFL team per run, refreshing each team weekly.
+const ESPN_TEAMS = ['ARI', 'ATL', 'BAL', 'BUF', 'CAR', 'CHI', 'CIN', 'CLE', 'DAL', 'DEN', 'DET', 'GB', 'HOU', 'IND', 'JAX', 'KC',
+  'LV', 'LAC', 'LAR', 'MIA', 'MIN', 'NE', 'NO', 'NYG', 'NYJ', 'PHI', 'PIT', 'SF', 'SEA', 'TB', 'TEN', 'WSH'];
+async function espnRosterStep(env) {
+  let pick = null;
+  for (const abbr of ESPN_TEAMS) {
+    const at = Number((await getKV(env, `espn_roster_at:${abbr}`)) || 0);
+    if (Date.now() - at > 6 * 86400e3 && (!pick || at < pick.at)) pick = { abbr, at };
   }
+  if (!pick) return false;
+  await setKV(env, `espn_roster_at:${pick.abbr}`, Date.now());
+  const res = await fetch(`https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/${pick.abbr.toLowerCase()}/roster`, { headers: ESPN_HEADERS });
+  if (!res.ok) { console.error(`ESPN roster ${pick.abbr} returned ${res.status}`); return true; }
+  const data = await res.json();
+  const ids = new Map();
+  for (const grp of data.athletes || []) for (const a of grp.items || []) if (a.fullName && a.id) ids.set(normName(a.fullName), String(a.id));
+  const team = normTeam(pick.abbr);
+  const ours = (await env.DB.prepare("SELECT id, name FROM players WHERE team = ? AND pos != 'DEF'").bind(team).all()).results;
+  const stmts = [];
+  for (const p of ours) {
+    const espnId = ids.get(normName(p.name));
+    if (espnId) stmts.push(env.DB.prepare('UPDATE players SET espn_id = ? WHERE id = ?').bind(espnId, p.id));
+  }
+  if (stmts.length) await env.DB.batch(stmts);
+  return true;
 }
 
 const stripHtml = (t) => String(t || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#39;|&rsquo;/g, "'").replace(/&quot;/g, '"').replace(/\s+/g, ' ').trim();
 
-async function fetchNews(env, p, diag) {
-  const espnId = await resolveEspnId(env, p, diag);
+async function fetchNews(env, p, diag, forceEspnId) {
+  const espnId = forceEspnId || await resolveEspnId(env, p, diag);
   if (diag) diag.espn_id = espnId;
   if (!espnId) return []; // don't cache a failed lookup
   let items = [];
@@ -848,6 +862,7 @@ async function newsForPlayers(env, players, fetchLimit) {
   for (const p of players) {
     const c = cached[p.id];
     if (c && Date.now() - c.fetched_at < NEWS_TTL) { byPlayer[p.id] = JSON.parse(c.items); continue; }
+    if (!p.espn_id || p.espn_id === 'none') { if (c) byPlayer[p.id] = JSON.parse(c.items); else missing += 1; continue; }
     if (fetched < fetchLimit) { fetched += 1; byPlayer[p.id] = await fetchNews(env, p); continue; }
     if (c) byPlayer[p.id] = JSON.parse(c.items);
     else missing += 1;
@@ -857,7 +872,8 @@ async function newsForPlayers(env, players, fetchLimit) {
 
 async function newsStep(env, limit) {
   const stale = (await env.DB.prepare(`SELECT p.id, p.name, p.pos, p.espn_id FROM rosters r JOIN players p ON p.id = r.player_id
-    LEFT JOIN player_news n ON n.player_id = p.id WHERE p.pos != 'DEF' AND (n.fetched_at IS NULL OR n.fetched_at < ?)
+    LEFT JOIN player_news n ON n.player_id = p.id WHERE p.pos != 'DEF' AND p.espn_id IS NOT NULL AND p.espn_id != 'none'
+      AND (n.fetched_at IS NULL OR n.fetched_at < ?)
     ORDER BY n.fetched_at IS NOT NULL, n.fetched_at LIMIT ?`).bind(Date.now() - NEWS_TTL, limit).all()).results;
   for (const p of stale) await fetchNews(env, p);
 }
@@ -866,8 +882,8 @@ async function apiPlayerNews(env, id, debug) {
   const p = await env.DB.prepare('SELECT id, name, pos, espn_id FROM players WHERE id = ?').bind(id).first();
   if (!p) throw new HttpError(404, 'Player not found.');
   if (debug) {
-    const diag = { player: p.name, stored_espn_id: p.espn_id || null };
-    const items = await fetchNews(env, { ...p, espn_id: null }, diag);
+    const diag = { player: p.name };
+    const items = await fetchNews(env, p, diag, debug === true ? null : debug);
     return { diag, items: recentNews(items).length };
   }
   const { byPlayer } = await newsForPlayers(env, [p], 1);

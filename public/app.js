@@ -204,6 +204,19 @@ document.addEventListener('click', (e) => {
 document.addEventListener('visibilitychange', () => { if (!document.hidden) heartbeat(); });
 setInterval(heartbeat, 45000);
 
+// ------------------------------------------------------------ player news
+const newsWhen = (iso) => {
+  const h = (Date.now() - Date.parse(iso)) / 3600e3;
+  if (h < 1) return 'Just now';
+  if (h < 24) return `${Math.round(h)}h ago`;
+  return new Date(iso).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+};
+const newsItem = (n, withPlayer) => `<li class="news-item">
+  <div class="news-meta">${withPlayer ? `<button class="pname" data-player="${esc(n.player_id)}">${esc(n.player)}</button> <span class="pmeta">${esc(n.pos)} ${esc(n.nfl || '')}</span> ` : ''}<span class="pmeta">${newsWhen(n.published)}</span></div>
+  <div class="news-head">${esc(n.headline)}</div>
+  ${n.story ? `<details><summary>Analysis</summary><p>${esc(n.story)}</p></details>` : ''}
+</li>`;
+
 // ------------------------------------------------------------ router
 async function router() {
   clearInterval(state.timer);
@@ -316,8 +329,9 @@ async function renderTeam(id) {
       <td class="slot">${esc(slotLabel)}</td>
       <td>${playerCell(p)}</td>
       <td class="hide-sm">${gameText(p.game)}</td>
-      <td class="r pts">${pts(p.points)}<div class="pmeta show-sm">proj ${pts(p.proj)}</div></td>
+      <td class="r pts">${pts(p.points)}<div class="pmeta show-sm">proj ${pts(p.proj)}</div><div class="pmeta show-sm">season ${pts(p.season_pts)}</div></td>
       <td class="r hide-sm muted">${pts(p.proj)}</td>
+      <td class="r hide-sm muted">${pts(p.season_pts)}</td>
       ${slotCell(p)}${dropCell(p)}
     </tr>`;
 
@@ -328,10 +342,10 @@ async function renderTeam(id) {
     const inSlot = d.starters.filter((p) => p.slot === slot);
     for (let i = 0; i < count; i++) {
       const p = inSlot[i];
-      starterRows.push(p ? prow(p, slot) : `<tr><td class="slot">${slot}</td><td class="empty-slot" colspan="${own ? 6 : 4}">Empty</td></tr>`);
+      starterRows.push(p ? prow(p, slot) : `<tr><td class="slot">${slot}</td><td class="empty-slot" colspan="${own ? 7 : 5}">Empty</td></tr>`);
     }
   }
-  const head = `<thead><tr><th>Slot</th><th>Player</th><th class="hide-sm">Game</th><th class="r">Pts</th><th class="r hide-sm">Proj</th>${own ? '<th>Move to</th><th></th>' : ''}</tr></thead>`;
+  const head = `<thead><tr><th>Slot</th><th>Player</th><th class="hide-sm">Game</th><th class="r">Pts</th><th class="r hide-sm">Proj</th><th class="r hide-sm">Season</th>${own ? '<th>Move to</th><th></th>' : ''}</tr></thead>`;
   const irPlayers = d.bench.filter((p) => p.slot === 'IR');
   const benchPlayers = d.bench.filter((p) => p.slot !== 'IR');
   const rosterCount = d.starters.length + benchPlayers.length;
@@ -363,15 +377,25 @@ async function renderTeam(id) {
     <h2>Starters</h2>
     <div class="table-wrap"><table>${head}<tbody>${starterRows.join('')}</tbody></table></div>
     <h2>Bench</h2>
-    <div class="table-wrap"><table>${head}<tbody>${benchPlayers.map((p) => prow(p, 'BN')).join('') || `<tr><td colspan="7" class="muted">No bench players.</td></tr>`}</tbody></table></div>
+    <div class="table-wrap"><table>${head}<tbody>${benchPlayers.map((p) => prow(p, 'BN')).join('') || `<tr><td colspan="8" class="muted">No bench players.</td></tr>`}</tbody></table></div>
     ${d.ir_max ? `<h2>Injured reserve <span class="muted" style="font-size:13px;font-weight:500">Doesn't count toward the ${d.roster_max}. For players listed ${esc(d.ir_statuses.join(', '))}.</span></h2>
-    <div class="table-wrap"><table>${head}<tbody>${irPlayers.map((p) => prow(p, 'IR')).join('')}${Array.from({ length: Math.max(0, d.ir_max - irPlayers.length) }, () => `<tr><td class="slot">IR</td><td class="empty-slot" colspan="${own ? 6 : 4}">Empty</td></tr>`).join('')}</tbody></table></div>` : ''}
+    <div class="table-wrap"><table>${head}<tbody>${irPlayers.map((p) => prow(p, 'IR')).join('')}${Array.from({ length: Math.max(0, d.ir_max - irPlayers.length) }, () => `<tr><td class="slot">IR</td><td class="empty-slot" colspan="${own ? 7 : 5}">Empty</td></tr>`).join('')}</tbody></table></div>` : ''}
     ${own ? `<div class="toolbar"><span class="muted" style="font-size:12.5px">Lineup changes save automatically. Moving a player into a full spot sends the player there to the bench.</span><a class="btn" href="#players">Find players</a></div>` : ''}`}
+    ${t.eliminated_week ? '' : '<h2>Player news <span class="muted" style="font-size:13px;font-weight:500">Past 7 days, via RotoWire on ESPN</span></h2><div class="panel" id="team-news"><p class="muted">Loading news</p></div>'}
     ${d.history.length ? `<h2>Weekly results</h2><div class="panel"><ul class="list">${d.history.map((h) => `
       <li><span>Week ${lw(h.week)}${h.eliminated ? ' <span class="badge cut">Cut</span>' : ''}</span><span class="num">${pts(h.points)} <span class="muted">rank ${h.rank}</span></span></li>`).join('')}</ul></div>` : ''}
     ${d.is_owner ? '' : (state.me ? '' : `<p class="muted" style="margin-top:24px">Managing this team? Open the private link the commissioner sent you.</p>`)}`;
 
   bindPlayerLinks();
+  const newsBox = document.getElementById('team-news');
+  if (newsBox) {
+    api(`/api/teams/${id}/news`).then((n) => {
+      newsBox.innerHTML = n.items.length
+        ? `<ul class="list news-list">${n.items.map((x) => newsItem(x, true)).join('')}</ul>${n.missing ? `<p class="pmeta">Still gathering news for ${n.missing} player${n.missing > 1 ? 's' : ''}. Check back in a few minutes.</p>` : ''}`
+        : `<p class="muted">${n.missing ? 'Gathering news for your players. Check back in a few minutes.' : 'No news for these players in the past week.'}</p>`;
+      newsBox.querySelectorAll('[data-player]').forEach((b) => b.addEventListener('click', () => showPlayer(b.dataset.player)));
+    }).catch(() => { newsBox.innerHTML = '<p class="muted">News is unavailable right now.</p>'; });
+  }
   document.getElementById('logo-file')?.addEventListener('change', async (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -474,7 +498,7 @@ async function renderPlayers() {
     const waiver = p.on_waivers || !d.instant_free_agents || !!p.my_bid;
     const mb = p.my_bid;
     const drops = mb ? dropOptions.replace(`value="${esc(mb.drop_player_id || '')}"`, `value="${esc(mb.drop_player_id || '')}" selected`) : dropOptions;
-    return `<tr class="form-row"><td colspan="6"><div class="inline-form">
+    return `<tr class="form-row"><td colspan="7"><div class="inline-form">
       ${waiver ? `<label>${mb ? 'Change your bid' : 'Bid'} (you have $${mine.team.faab})<input type="number" min="0" max="${mine.team.faab}" step="1" value="${mb ? mb.bid : 0}" id="bid-amt" style="width:110px"></label>` : ''}
       <label>Drop<select id="bid-drop">${drops}</select></label>
       <button class="btn primary" data-submit="${esc(p.id)}" data-waiver="${waiver ? 1 : 0}" data-name="${esc(p.name)}" data-editing="${mb ? 1 : 0}">${mb ? 'Update bid' : waiver ? 'Place bid' : 'Add player'}</button>
@@ -493,15 +517,16 @@ async function renderPlayers() {
       <label class="check"><input type="checkbox" id="all" ${f.all ? 'checked' : ''}> Include rostered</label>
     </div>
     <div class="table-wrap"><table>
-      <thead><tr><th>Player</th><th class="hide-sm">Game</th><th>Status</th><th class="r">Wk ${lw(d.week)}</th><th class="r">Proj</th><th></th></tr></thead>
+      <thead><tr><th>Player</th><th class="hide-sm">Game</th><th>Status</th><th class="r">Wk ${lw(d.week)}</th><th class="r">Proj</th><th class="r">Season</th><th></th></tr></thead>
       <tbody>${d.players.map((p) => `<tr>
         <td><button class="pname" data-player="${esc(p.id)}">${esc(p.name)}</button>${p.injury ? `<span class="inj">${esc(p.injury)}</span>` : ''}<div class="pmeta">${esc(p.pos)} ${esc(p.nfl || 'FA')}${byeText(d.byes, p.nfl, d.week)}</div><div class="pmeta show-sm">${gameText(p.game)}</div></td>
         <td class="hide-sm">${gameText(p.game)}</td>
         <td>${statusOf(p)}</td>
         <td class="r pts">${pts(p.points)}</td>
         <td class="r muted">${pts(p.proj)}</td>
+        <td class="r">${pts(p.season_pts)}</td>
         <td class="r">${actionOf(p)}</td>
-      </tr>${state.openRow === p.id ? formRow(p) : ''}`).join('') || '<tr><td colspan="6" class="muted">No players match. Try another name or position.</td></tr>'}</tbody>
+      </tr>${state.openRow === p.id ? formRow(p) : ''}`).join('') || '<tr><td colspan="7" class="muted">No players match. Try another name or position.</td></tr>'}</tbody>
     </table></div>`;
 
   bindPlayerLinks();
@@ -542,10 +567,17 @@ async function showPlayer(id) {
     body.innerHTML = `
       <h2 id="pd-title">${esc(p.name)}</h2>
       <p class="muted">${esc(p.pos)} ${esc(p.nfl || 'FA')}${p.injury ? `, ${esc(p.injury)}` : ''}${p.fantasy_team ? `. On ${esc(p.fantasy_team)}` : '. Unrostered'}</p>
-      <p>Week ${lw(d.week)}: <b class="num">${pts(d.points)}</b> points, projected <span class="num">${pts(d.proj)}</span>${d.preset !== 'custom' ? ` (${esc(d.preset.replace('_', ' '))} scoring)` : ''}.</p>
+      <p>Week ${lw(d.week)}: <b class="num">${pts(d.points)}</b> points, projected <span class="num">${pts(d.proj)}</span>. Season: <b class="num">${pts(d.season_pts)}</b>${d.preset !== 'custom' ? ` (${esc(d.preset.replace('_', ' '))} scoring)` : ''}.</p>
       ${d.breakdown.length ? `<div class="table-wrap"><table><thead><tr><th>Stat</th><th class="r">Value</th><th class="r">Pts each</th><th class="r">Pts</th></tr></thead><tbody>
         ${d.breakdown.map((b) => `<tr><td>${esc(STAT_LABELS[b.key] || b.key)} <span class="pmeta">${esc(b.key)}</span></td><td class="r">${b.value}</td><td class="r muted">${b.weight ?? ''}</td><td class="r">${b.points != null ? pts(b.points) : ''}</td></tr>`).join('')}
-      </tbody></table></div>` : '<p class="muted">No stats yet this week.</p>'}`;
+      </tbody></table></div>` : '<p class="muted">No stats yet this week.</p>'}
+      ${p.pos === 'DEF' ? '' : '<h3 style="margin-top:18px">News, past 7 days</h3><div id="pd-news"><p class="muted">Loading news</p></div>'}`;
+    if (p.pos !== 'DEF') {
+      api(`/api/players/${encodeURIComponent(id)}/news`).then((n) => {
+        const box = document.getElementById('pd-news');
+        if (box) box.innerHTML = n.items.length ? `<ul class="list news-list">${n.items.map((x) => newsItem(x, false)).join('')}</ul><p class="pmeta">Via RotoWire on ESPN.</p>` : '<p class="muted">No news in the past week.</p>';
+      }).catch(() => { const box = document.getElementById('pd-news'); if (box) box.innerHTML = '<p class="muted">News is unavailable right now.</p>'; });
+    }
   } catch (e) { body.innerHTML = `<p>${esc(e.message)}</p>`; }
 }
 

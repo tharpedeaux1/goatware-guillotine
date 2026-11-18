@@ -225,7 +225,7 @@ async function router() {
     if (view === 'live') { await renderLive(); state.timer = setInterval(() => renderLive().catch(() => {}), 30000); }
     else if (view === 'team') { await renderTeam(Number(arg)); state.timer = setInterval(() => { if (!state.dirty && !state.openRow) renderTeam(Number(arg)).catch(() => {}); }, 30000); }
     else if (view === 'players') await renderPlayers();
-    else if (view === 'graveyard') await renderGraveyard();
+    else if (view === 'graveyard') { location.replace('#live'); return; }
     else if (view === 'activity') await renderActivity();
     else if (view === 'admin') await renderAdmin();
     else location.replace('#live');
@@ -237,7 +237,7 @@ async function router() {
 
 // ------------------------------------------------------------ chopping block
 async function renderLive() {
-  const d = await api('/api/live');
+  const [d, gy] = await Promise.all([api('/api/live'), api('/api/graveyard')]);
   state.firstWeek = d.first_week || 1;
   document.getElementById('league-name').textContent = d.league;
   document.title = `Week ${lw(d.week)}, ${d.league}`;
@@ -264,8 +264,8 @@ async function renderLive() {
     </a></li>`;
 
   $app.innerHTML = `
-    <img class="banner" src="/banner-wide.jpg" srcset="/banner-wide-1200.jpg 1200w, /banner-wide.jpg 2400w" sizes="(max-width: 1180px) 100vw, 1124px"
-      width="2400" height="480" alt="Goatware">
+    <img class="banner" src="/banner-btf.jpg" srcset="/banner-btf-1200.jpg 1200w, /banner-btf.jpg 2400w" sizes="(max-width: 1180px) 100vw, 1124px"
+      width="2400" height="480" alt="Brad Tharp &amp; Friends Fantasy Football League">
     <section class="hero">
       <h1>Week ${lw(d.week)} <em>Chopping Block</em></h1>
       <p>${status}</p>
@@ -286,13 +286,10 @@ async function renderLive() {
       </li>` : ''}
       ${doomed.map((t, i) => row(t, safe.length + i + 1, 'doomed')).join('')}
     </ol></div>` : `<div class="panel"><h3>No teams yet</h3><p>The commissioner can import owners and rosters from the Commissioner page.</p></div>`}
-    <h2>NFL this week</h2>
-    <div class="game-grid">${d.games.map((g) => `
-      <div class="game ${g.state}">
-        <div class="line"><b>${esc(g.away)}</b><span>${g.state === 'pre' ? '' : g.away_score}</span></div>
-        <div class="line"><b>${esc(g.home)}</b><span>${g.state === 'pre' ? '' : g.home_score}</span></div>
-        <div class="gdetail">${g.state === 'pre' ? kick(g.kickoff) : esc(g.detail)}</div>
-      </div>`).join('')}</div>`;
+    <h2 id="chopped">Chopped</h2>
+    ${gy.teams.length ? `<div class="panel"><ul class="list grave">${gy.teams.map((t) => `
+      <li><span class="gw">Week ${lw(t.eliminated_week)}</span><span style="flex:1;display:flex;align-items:center;gap:10px">${teamLogo(t.id, t.logo_v, t.name, 'sm')}<span><a href="#team/${t.id}" class="gname">${esc(t.name)}</a> <span class="muted">${esc(t.owner)}</span></span></span><span class="num">${t.points != null ? pts(t.points) : ''}</span></li>`).join('')}</ul></div>`
+    : '<div class="panel"><p class="muted">Nobody has been chopped yet. The first cut happens after the current week goes final.</p></div>'}`;
 }
 
 // ------------------------------------------------------------ team page
@@ -341,22 +338,25 @@ async function renderTeam(id) {
   const over = rosterCount - d.roster_max;
 
   $app.innerHTML = `
-    <section class="hero">
-      <div class="hero-logo">${teamLogo(t.id, t.logo_v, t.name, 'xl')}</div>
-      ${d.is_owner ? `<div class="toolbar center logo-tools">
-        <label class="btn sm">${t.logo_v ? 'Change logo' : 'Add a team logo'}<input type="file" id="logo-file" accept="image/*" hidden></label>
-        ${t.logo_v ? '<button class="btn sm danger" id="logo-remove">Remove logo</button>' : ''}
-      </div>` : ''}
-      <h1>${esc(t.name)}</h1>
-      <p>${esc(t.owner)} ${isOnline(t.id) ? '<span class="online-chip"><span class="live-dot"></span>Online now</span>' : ''} ${t.eliminated_week ? `<span class="badge cut">Cut in week ${lw(t.eliminated_week)}</span>` : '<span class="badge alive">Alive</span>'}</p>
+    <section class="team-top">
+      <div class="team-id">
+        ${teamLogo(t.id, t.logo_v, t.name, 'xl')}
+        <div class="team-id-text">
+          <h1>${esc(t.name)}</h1>
+          <p>${esc(t.owner)} ${isOnline(t.id) ? '<span class="online-chip"><span class="live-dot"></span>Online now</span>' : ''} ${t.eliminated_week ? `<span class="badge cut">Cut in week ${lw(t.eliminated_week)}</span>` : '<span class="badge alive">Alive</span>'}</p>
+          ${d.is_owner ? `<div class="logo-tools">
+            <label class="btn sm">${t.logo_v ? 'Change logo' : 'Add a team logo'}<input type="file" id="logo-file" accept="image/*" hidden></label>
+            ${t.logo_v ? '<button class="btn sm danger" id="logo-remove">Remove logo</button>' : ''}
+          </div>` : ''}
+        </div>
+      </div>
+      ${tiles([
+        { icon: 'chart', color: 'blue', value: `${pts(t.points)}<span class="stat-proj">proj ${pts(t.projected)}</span>`, label: `Week ${lw(d.week)} points` },
+        { icon: 'trophy', color: 'gold', value: pts(t.season_total), label: 'Season total' },
+        { icon: 'wallet', color: 'navy', value: `$${t.faab}`, label: 'FAAB left' },
+        { icon: 'list', color: 'red', value: `${rosterCount}/${d.roster_max}`, label: d.ir_max ? `Active, ${irPlayers.length}/${d.ir_max} IR` : 'Roster spots' },
+      ], 'team-tiles')}
     </section>
-    ${tiles([
-      { icon: 'chart', color: 'blue', value: pts(t.points), label: `Week ${lw(d.week)} points` },
-      { icon: 'target', color: 'green', value: pts(t.projected), label: 'Projected' },
-      { icon: 'trophy', color: 'gold', value: pts(t.season_total), label: 'Season total' },
-      { icon: 'wallet', color: 'navy', value: `$${t.faab}`, label: 'FAAB left' },
-      { icon: 'list', color: 'red', value: `${rosterCount}/${d.roster_max}`, label: d.ir_max ? `Active spots, ${irPlayers.length}/${d.ir_max} IR` : 'Roster spots' },
-    ], 'five')}
     ${!t.eliminated_week && over > 0 ? `<div class="over-limit"><b>Over the roster limit.</b> This team has ${rosterCount} active players and the limit is ${d.roster_max}.
       ${own ? `Drop ${over} player${over > 1 ? 's' : ''} or move an injured player to IR before adding anyone.` : 'The owner needs to drop players before adding anyone.'}</div>` : ''}
     ${t.eliminated_week ? '' : `
@@ -367,11 +367,6 @@ async function renderTeam(id) {
     ${d.ir_max ? `<h2>Injured reserve <span class="muted" style="font-size:13px;font-weight:500">Doesn't count toward the ${d.roster_max}. For players listed ${esc(d.ir_statuses.join(', '))}.</span></h2>
     <div class="table-wrap"><table>${head}<tbody>${irPlayers.map((p) => prow(p, 'IR')).join('')}${Array.from({ length: Math.max(0, d.ir_max - irPlayers.length) }, () => `<tr><td class="slot">IR</td><td class="empty-slot" colspan="${own ? 6 : 4}">Empty</td></tr>`).join('')}</tbody></table></div>` : ''}
     ${own ? `<div class="toolbar"><button class="btn primary" id="save-lineup">Save lineup</button><a class="btn" href="#players">Find players</a></div>` : ''}`}
-    ${own && d.claims.length ? `<h2>Your waiver bids</h2><div class="panel"><ul class="list">${d.claims.map((c) => `
-      <li><span><b>${esc(c.player)}</b> <span class="muted">${esc(c.pos)} ${esc(c.nfl || '')}</span> for <b>$${c.bid}</b>${c.drop_name ? `, dropping ${esc(c.drop_name)}` : ''}
-        <div class="pmeta">${c.status === 'pending' ? `Pending until waivers run Wednesday${c.other_bids ? `. ${c.other_bids} other bid${c.other_bids > 1 ? 's' : ''}` : ''}` : `${esc(c.reason || c.status)}${c.status === 'lost' && c.winning_bid != null ? ` for $${c.winning_bid}` : ''}`}</div></span>
-        ${c.status === 'pending' ? `<button class="btn sm" data-cancel="${c.id}">Cancel bid</button>` : `<span class="muted">${esc(c.status)}</span>`}
-      </li>`).join('')}</ul></div>` : ''}
     ${d.history.length ? `<h2>Weekly results</h2><div class="panel"><ul class="list">${d.history.map((h) => `
       <li><span>Week ${lw(h.week)}${h.eliminated ? ' <span class="badge cut">Cut</span>' : ''}</span><span class="num">${pts(h.points)} <span class="muted">rank ${h.rank}</span></span></li>`).join('')}</ul></div>` : ''}
     ${d.is_owner ? '' : (state.me ? '' : `<p class="muted" style="margin-top:24px">Managing this team? Open the private link the commissioner sent you.</p>`)}`;
@@ -519,15 +514,6 @@ async function showPlayer(id) {
 }
 
 // ------------------------------------------------------------ graveyard / activity
-async function renderGraveyard() {
-  const d = await api('/api/graveyard');
-  state.firstWeek = d.first_week || 1;
-  $app.innerHTML = `<section class="hero"><h1>The <em>Graveyard</em></h1><p>Every team that lost its head, most recent first.</p></section>
-    ${d.teams.length ? `<div class="panel"><ul class="list grave">${d.teams.map((t) => `
-      <li><span class="gw">Week ${lw(t.eliminated_week)}</span><span style="flex:1;display:flex;align-items:center;gap:10px">${teamLogo(t.id, t.logo_v, t.name, 'sm')}<span><a href="#team/${t.id}" class="gname">${esc(t.name)}</a> <span class="muted">${esc(t.owner)}</span></span></span><span class="num">${t.points != null ? pts(t.points) : ''}</span></li>`).join('')}</ul></div>`
-    : '<div class="panel"><p>Nobody has been cut yet. The first cut happens after the current week goes final.</p></div>'}`;
-}
-
 async function renderActivity() {
   const [d, w] = await Promise.all([api('/api/activity'), api('/api/waivers/results')]);
   state.firstWeek = w.first_week || 1;

@@ -97,13 +97,20 @@ const SCHEMA = [
   "CREATE TABLE IF NOT EXISTS transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL DEFAULT (datetime('now')), week INTEGER, type TEXT NOT NULL, team_id INTEGER, player_id TEXT, detail TEXT)",
   'CREATE TABLE IF NOT EXISTS presence (vid TEXT PRIMARY KEY, team_id INTEGER, page TEXT, last_seen INTEGER NOT NULL)',
   'CREATE INDEX IF NOT EXISTS idx_presence_seen ON presence(last_seen)',
+  'CREATE TABLE IF NOT EXISTS player_news (player_id TEXT PRIMARY KEY, items TEXT NOT NULL, fetched_at INTEGER NOT NULL)',
 ];
 let schemaReady = false;
 async function ensureSchema(env) {
   if (schemaReady) return;
   await env.DB.batch(SCHEMA.map((q) => env.DB.prepare(q))); // all IF NOT EXISTS, so safe to repeat
-  for (const q of ['ALTER TABLE teams ADD COLUMN logo TEXT', 'ALTER TABLE teams ADD COLUMN logo_v INTEGER', 'ALTER TABLE claims ADD COLUMN run_id INTEGER']) {
+  for (const q of ['ALTER TABLE teams ADD COLUMN logo TEXT', 'ALTER TABLE teams ADD COLUMN logo_v INTEGER', 'ALTER TABLE claims ADD COLUMN run_id INTEGER', 'ALTER TABLE players ADD COLUMN espn_id TEXT']) {
     try { await env.DB.prepare(q).run(); } catch { /* column already exists */ }
+  }
+  // One-time fix: players dropped to make room for waiver wins used to go back on waivers. They're free agents now.
+  if (!(await getKV(env, 'fix_run_drops_v1'))) {
+    await env.DB.prepare(`DELETE FROM waiver_wire WHERE player_id IN (SELECT drop_player_id FROM claims
+      WHERE status = 'won' AND drop_player_id IS NOT NULL AND run_id IS NOT NULL)`).run();
+    await setKV(env, 'fix_run_drops_v1', Date.now());
   }
   schemaReady = true;
 }
@@ -138,6 +145,11 @@ async function tick(env) {
     return;
   }
 
+  // Season points: score one past week per run, then add them up.
+  if (await seasonPointsStep(env, s)) return;
+  // Keep rostered players' news fresh, a few players per run.
+  await newsStep(env, 4);
+
   // Forget devices not seen in 30 days.
   if ((await getKV(env, 'presence_cleaned')) !== today) {
     await setKV(env, 'presence_cleaned', today);
@@ -169,6 +181,8 @@ async function route(req, env, ctx, url) {
   if (m === 'GET' && p === '/api/graveyard') return json(await apiGraveyard(env));
   if (m === 'GET' && p === '/api/players') return json(await apiPlayers(env, url, req));
   if (m === 'GET' && p === '/api/waivers/results') return json(await apiWaiverResults(env));
+  if (m === 'GET' && (mt = p.match(/^\/api\/players\/([^/]+)\/news$/))) return json(await apiPlayerNews(env, decodeURIComponent(mt[1])));
+  if (m === 'GET' && (mt = p.match(/^\/api\/teams\/(\d+)\/news$/))) return json(await apiTeamNews(env, Number(mt[1])));
   if (m === 'GET' && (mt = p.match(/^\/api\/players\/([^/]+)$/))) return json(await apiPlayer(env, decodeURIComponent(mt[1])));
   if (m === 'GET' && p === '/api/activity') return json(await apiActivity(env));
   if (m === 'POST' && p === '/api/presence') return json(await apiPresence(env, req, await body()));
@@ -492,6 +506,7 @@ async function buildWeek(env, s) {
     loadBlob(env, 'proj', season, week),
     env.DB.prepare('SELECT team_id, SUM(points) AS total FROM team_weeks WHERE season = ? GROUP BY team_id').bind(season).all(),
   ]);
+  const spts = await loadBlob(env, 'spts', season, 0);
   const gameBy = gameIndex(games);
   const totals = Object.fromEntries(totalsR.results.map((r) => [r.team_id, r.total || 0]));
   const order = Object.keys(s.roster_slots);
@@ -503,6 +518,7 @@ async function buildWeek(env, s) {
     const t = byId[r.team_id];
     if (!t) continue;
     const pl = decoratePlayer(r, gameBy, stats, proj, s, now);
+    pl.season_pts = round2((spts[r.player_id] || 0) + pl.points);
     if (isStarter(r.slot) && Number(s.roster_slots[r.slot]) > 0 && r.slot !== 'IR') { t.starters.push(pl); t.points += pl.points; t.projected += pl.projected; }
     else { t.bench.push(pl); if (r.slot !== 'IR') t.bench_points += pl.points; }
   }
@@ -609,10 +625,11 @@ async function apiPlayers(env, url, req) {
     LEFT JOIN waiver_wire w ON w.player_id = p.id
     WHERE (?1 = '' OR p.pos = ?1) AND (?2 = '' OR p.name LIKE ?2) AND (?3 = 1 OR r.player_id IS NULL)`)
     .bind(pos, q ? `%${q}%` : '', all ? 1 : 0).all()).results;
-  const [games, stats, proj] = await Promise.all([
+  const [games, stats, proj, spts] = await Promise.all([
     loadGames(env, s.season, s.current_week),
     loadBlob(env, 'stats', s.season, s.current_week),
     loadBlob(env, 'proj', s.season, s.current_week),
+    loadBlob(env, 'spts', s.season, 0),
   ]);
   const gameBy = gameIndex(games);
   const now = Date.now();
@@ -624,6 +641,7 @@ async function apiPlayers(env, url, req) {
       points: playerPoints(stats[r.id], s.scoring), proj: playerPoints(proj[r.id], s.scoring),
       locked: isLocked(g, now), game: gameFor(g, r.nfl), state: g ? g.state : 'bye',
       other_bids: otherBids[r.id] || 0, my_bid: myBids[r.id] || null,
+      season_pts: round2((spts[r.id] || 0) + playerPoints(stats[r.id], s.scoring)),
     };
   }).sort((a, b) => (b.my_bid ? 1 : 0) - (a.my_bid ? 1 : 0) || b.proj - a.proj || b.points - a.points).slice(0, 150);
   return { week: s.current_week, first_week: s.first_week || 1, instant_free_agents: s.instant_free_agents, players, byes: await getByes(env, s.season) };
@@ -634,9 +652,10 @@ async function apiPlayer(env, id) {
   const p = await env.DB.prepare(`SELECT p.*, t.name AS fantasy_team FROM players p
     LEFT JOIN rosters r ON r.player_id = p.id LEFT JOIN teams t ON t.id = r.team_id WHERE p.id = ?`).bind(id).first();
   if (!p) throw new HttpError(404, 'Player not found.');
-  const [stats, proj] = await Promise.all([
+  const [stats, proj, spts] = await Promise.all([
     loadBlob(env, 'stats', s.season, s.current_week),
     loadBlob(env, 'proj', s.season, s.current_week),
+    loadBlob(env, 'spts', s.season, 0),
   ]);
   const st = stats[id] || {};
   const weights = s.scoring?.weights || {};
@@ -649,6 +668,7 @@ async function apiPlayer(env, id) {
     week: s.current_week, first_week: s.first_week || 1, preset: s.scoring?.preset || 'custom',
     player: { id: p.id, name: p.name, pos: p.pos, nfl: p.team, injury: p.injury, fantasy_team: p.fantasy_team },
     points: playerPoints(st, s.scoring), proj: playerPoints(proj[id], s.scoring), breakdown,
+    season_pts: round2((spts[id] || 0) + playerPoints(st, s.scoring)),
   };
 }
 
@@ -707,6 +727,136 @@ async function getByes(env, season) {
     console.error(e);
     return raw ? JSON.parse(raw).byes : {};
   }
+}
+
+// ---------------------------------------------------------------- season points
+// Each past week is scored with the league's own rules (so per-game bonuses count), stored, then summed.
+function scoringHash(s) {
+  const str = JSON.stringify(s.scoring || {});
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
+  return String(h);
+}
+
+async function seasonPointsStep(env, s) {
+  if (!s.season || !s.current_week) return false;
+  const hash = scoringHash(s);
+  for (let w = 1; w < Math.min(s.current_week, 19); w++) {
+    if ((await getKV(env, `wpts:${s.season}:${w}`)) === hash) continue;
+    const res = await fetch(`${SLEEPER}/stats/nfl/regular/${s.season}/${w}`, { headers: UA });
+    if (!res.ok) throw new Error(`Sleeper week ${w} stats returned ${res.status}`);
+    const raw = normalizeStatsPayload(await res.json());
+    const pts = {};
+    for (const [pid, st] of Object.entries(raw)) {
+      const p = playerPoints(st, s.scoring);
+      if (p) pts[pid] = p;
+    }
+    await env.DB.prepare(`INSERT INTO stat_blobs (season, week, kind, data, fetched_at) VALUES (?, ?, 'wpts', ?, ?)
+      ON CONFLICT(season, week, kind) DO UPDATE SET data = excluded.data, fetched_at = excluded.fetched_at`)
+      .bind(s.season, w, JSON.stringify(pts), new Date().toISOString()).run();
+    await setKV(env, `wpts:${s.season}:${w}`, hash);
+    await setKV(env, `spts_dirty:${s.season}`, 1);
+    return true;
+  }
+  if ((await getKV(env, `spts_dirty:${s.season}`)) === '1' || (await getKV(env, `spts_week:${s.season}`)) !== String(s.current_week)) {
+    const rows = (await env.DB.prepare("SELECT week, data FROM stat_blobs WHERE season = ? AND kind = 'wpts' AND week < ?").bind(s.season, s.current_week).all()).results;
+    const total = {};
+    for (const r of rows) for (const [pid, p] of Object.entries(JSON.parse(r.data))) total[pid] = round2((total[pid] || 0) + p);
+    await env.DB.prepare(`INSERT INTO stat_blobs (season, week, kind, data, fetched_at) VALUES (?, 0, 'spts', ?, ?)
+      ON CONFLICT(season, week, kind) DO UPDATE SET data = excluded.data, fetched_at = excluded.fetched_at`)
+      .bind(s.season, JSON.stringify(total), new Date().toISOString()).run();
+    await setKV(env, `spts_dirty:${s.season}`, 0);
+    await setKV(env, `spts_week:${s.season}`, s.current_week);
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------- player news (ESPN, RotoWire blurbs)
+const NEWS_DAYS = 7;
+const NEWS_TTL = 2 * 3600e3;
+
+async function resolveEspnId(env, p) {
+  if (p.espn_id) return p.espn_id === 'none' ? null : p.espn_id;
+  if (p.pos === 'DEF') return null;
+  let id = null;
+  try {
+    const res = await fetch(`https://site.web.api.espn.com/apis/common/v3/search?query=${encodeURIComponent(p.name)}&limit=8&type=player`, { headers: UA });
+    if (res.ok) {
+      const items = ((await res.json()).items || []).filter((it) => it.league === 'nfl');
+      const exact = items.find((it) => normName(it.displayName) === normName(p.name));
+      id = (exact || items[0])?.id || null;
+    }
+  } catch (e) { console.error('espn search', e); }
+  await env.DB.prepare('UPDATE players SET espn_id = ? WHERE id = ?').bind(id || 'none', p.id).run();
+  return id;
+}
+
+const stripHtml = (t) => String(t || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#39;|&rsquo;/g, "'").replace(/&quot;/g, '"').replace(/\s+/g, ' ').trim();
+
+async function fetchNews(env, p) {
+  const espnId = await resolveEspnId(env, p);
+  let items = [];
+  if (espnId) {
+    try {
+      const res = await fetch(`https://site.api.espn.com/apis/fantasy/v2/games/ffl/news/players?limit=12&playerId=${espnId}`, { headers: UA });
+      if (res.ok) {
+        items = ((await res.json()).feed || [])
+          .filter((x) => x.type === 'Rotowire' && x.published)
+          .map((x) => ({ id: String(x.id), headline: stripHtml(x.headline), story: stripHtml(x.story), published: x.published }));
+      }
+    } catch (e) { console.error('espn news', e); }
+  }
+  await env.DB.prepare(`INSERT INTO player_news (player_id, items, fetched_at) VALUES (?, ?, ?)
+    ON CONFLICT(player_id) DO UPDATE SET items = excluded.items, fetched_at = excluded.fetched_at`).bind(p.id, JSON.stringify(items), Date.now()).run();
+  return items;
+}
+
+const recentNews = (items) => {
+  const cutoff = Date.now() - NEWS_DAYS * 86400e3;
+  return items.filter((x) => Date.parse(x.published) >= cutoff).sort((a, b) => Date.parse(b.published) - Date.parse(a.published));
+};
+
+async function newsForPlayers(env, players, fetchLimit) {
+  const ids = players.map((p) => p.id);
+  if (!ids.length) return { byPlayer: {}, missing: 0 };
+  const cached = Object.fromEntries((await env.DB.prepare(`SELECT player_id, items, fetched_at FROM player_news WHERE player_id IN (${ids.map(() => '?').join(',')})`)
+    .bind(...ids).all()).results.map((r) => [r.player_id, r]));
+  const byPlayer = {};
+  let fetched = 0;
+  let missing = 0;
+  for (const p of players) {
+    const c = cached[p.id];
+    if (c && Date.now() - c.fetched_at < NEWS_TTL) { byPlayer[p.id] = JSON.parse(c.items); continue; }
+    if (fetched < fetchLimit) { fetched += 1; byPlayer[p.id] = await fetchNews(env, p); continue; }
+    if (c) byPlayer[p.id] = JSON.parse(c.items);
+    else missing += 1;
+  }
+  return { byPlayer, missing };
+}
+
+async function newsStep(env, limit) {
+  const stale = (await env.DB.prepare(`SELECT p.id, p.name, p.pos, p.espn_id FROM rosters r JOIN players p ON p.id = r.player_id
+    LEFT JOIN player_news n ON n.player_id = p.id WHERE p.pos != 'DEF' AND (n.fetched_at IS NULL OR n.fetched_at < ?)
+    ORDER BY n.fetched_at IS NOT NULL, n.fetched_at LIMIT ?`).bind(Date.now() - NEWS_TTL, limit).all()).results;
+  for (const p of stale) await fetchNews(env, p);
+}
+
+async function apiPlayerNews(env, id) {
+  const p = await env.DB.prepare('SELECT id, name, pos, espn_id FROM players WHERE id = ?').bind(id).first();
+  if (!p) throw new HttpError(404, 'Player not found.');
+  const { byPlayer } = await newsForPlayers(env, [p], 1);
+  return { items: recentNews(byPlayer[p.id] || []) };
+}
+
+async function apiTeamNews(env, teamId) {
+  const players = (await env.DB.prepare(`SELECT p.id, p.name, p.pos, p.team AS nfl, p.espn_id FROM rosters r JOIN players p ON p.id = r.player_id
+    WHERE r.team_id = ? AND p.pos != 'DEF'`).bind(teamId).all()).results;
+  const { byPlayer, missing } = await newsForPlayers(env, players, 6);
+  const items = [];
+  for (const p of players) for (const n of recentNews(byPlayer[p.id] || [])) items.push({ ...n, player_id: p.id, player: p.name, pos: p.pos, nfl: p.nfl });
+  items.sort((a, b) => Date.parse(b.published) - Date.parse(a.published));
+  return { items: items.slice(0, 15), missing };
 }
 
 // ---------------------------------------------------------------- team logos
@@ -988,7 +1138,6 @@ async function processWaivers(env) {
   }
   for (const t of Object.values(teams)) stmts.push(env.DB.prepare('UPDATE teams SET faab = ? WHERE id = ?').bind(t.faab, t.id));
   stmts.push(env.DB.prepare('DELETE FROM waiver_wire'));
-  for (const pid of newlyDropped) stmts.push(env.DB.prepare('INSERT OR IGNORE INTO waiver_wire (player_id) VALUES (?)').bind(pid));
   await env.DB.batch(stmts);
   s.last_waiver_run = new Date().toISOString();
   await saveSettings(env, s);

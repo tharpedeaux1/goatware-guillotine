@@ -98,6 +98,11 @@ const SCHEMA = [
   'CREATE TABLE IF NOT EXISTS presence (vid TEXT PRIMARY KEY, team_id INTEGER, page TEXT, last_seen INTEGER NOT NULL)',
   'CREATE INDEX IF NOT EXISTS idx_presence_seen ON presence(last_seen)',
   'CREATE TABLE IF NOT EXISTS player_news (player_id TEXT PRIMARY KEY, items TEXT NOT NULL, fetched_at INTEGER NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, from_team INTEGER NOT NULL, to_team INTEGER NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL, read_at INTEGER)',
+  'CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_team, read_at)',
+  'CREATE INDEX IF NOT EXISTS idx_messages_pair ON messages(from_team, to_team, id)',
+  'CREATE TABLE IF NOT EXISTS league_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, team_id INTEGER NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS league_reads (team_id INTEGER PRIMARY KEY, last_id INTEGER NOT NULL)',
 ];
 let schemaReady = false;
 async function ensureSchema(env) {
@@ -201,6 +206,11 @@ async function route(req, env, ctx, url) {
     const team = await requireOwner(env, req);
     if (m === 'GET' && p === '/api/me') return json({ team: { id: team.id, name: team.name, owner: team.owner, faab: team.faab, eliminated_week: team.eliminated_week } });
     if (m === 'POST' && p === '/api/me/lineup') return json(await setLineup(env, team, await body()));
+    if (m === 'GET' && p === '/api/me/unread') return json(await apiUnread(env, team));
+    if (m === 'GET' && p === '/api/me/league-chat') return json(await apiLeagueChat(env, team, Number(url.searchParams.get('after') || 0)));
+    if (m === 'POST' && p === '/api/me/league-chat') return json(await apiLeagueChatSend(env, team, await body()));
+    if (m === 'GET' && (mt = p.match(/^\/api\/me\/chats\/(\d+)$/))) return json(await apiChat(env, team, Number(mt[1]), Number(url.searchParams.get('after') || 0)));
+    if (m === 'POST' && (mt = p.match(/^\/api\/me\/chats\/(\d+)$/))) return json(await apiSendChat(env, team, Number(mt[1]), await body()));
     if (m === 'PUT' && p === '/api/me/logo') return json(await saveLogo(env, team.id, (await body()).data));
     if (m === 'DELETE' && p === '/api/me/logo') return json(await saveLogo(env, team.id, null));
     if (m === 'POST' && p === '/api/me/add') return json(await addFreeAgent(env, team, await body()));
@@ -953,6 +963,72 @@ async function onlineSummary(env) {
     if (!owners.has(r.team_id)) owners.set(r.team_id, { team_id: r.team_id, team: r.name, owner: r.owner, page: r.page, logo_v: r.logo_v });
   }
   return { owners: [...owners.values()], guests };
+}
+
+// ---------------------------------------------------------------- owner-to-owner chat
+
+async function apiUnread(env, me) {
+  const rows = (await env.DB.prepare(`SELECT m.from_team AS team_id, COUNT(*) AS count, t.name AS team, t.owner, t.logo_v
+    FROM messages m JOIN teams t ON t.id = m.from_team WHERE m.to_team = ? AND m.read_at IS NULL GROUP BY m.from_team`).bind(me.id).all()).results;
+  const read = await env.DB.prepare('SELECT last_id FROM league_reads WHERE team_id = ?').bind(me.id).first();
+  const league = (await env.DB.prepare('SELECT COUNT(*) AS n FROM league_messages WHERE id > ? AND team_id != ?').bind(read ? read.last_id : 0, me.id).first()).n;
+  return { total: rows.reduce((n, r) => n + r.count, 0), from: rows, league };
+}
+
+// League chat: one room for every owner. Viewing it marks it read.
+async function apiLeagueChat(env, me, after) {
+  const cols = 'SELECT m.id, m.team_id, m.body, m.created_at, t.name AS team, t.owner, t.logo_v FROM league_messages m LEFT JOIN teams t ON t.id = m.team_id';
+  const rows = after > 0
+    ? (await env.DB.prepare(`${cols} WHERE m.id > ? ORDER BY m.id LIMIT 100`).bind(after).all()).results
+    : (await env.DB.prepare(`${cols} ORDER BY m.id DESC LIMIT 100`).all()).results.reverse();
+  if (rows.length) {
+    const last = rows[rows.length - 1].id;
+    await env.DB.prepare(`INSERT INTO league_reads (team_id, last_id) VALUES (?, ?)
+      ON CONFLICT(team_id) DO UPDATE SET last_id = MAX(last_id, excluded.last_id)`).bind(me.id, last).run();
+  }
+  return { messages: rows.map((r) => ({ ...r, mine: r.team_id === me.id })) };
+}
+
+async function apiLeagueChatSend(env, me, { body }) {
+  const text = String(body || '').trim();
+  if (!text) throw new HttpError(400, 'Type a message first.');
+  if (text.length > 500) throw new HttpError(400, 'Messages can be up to 500 characters.');
+  const r = await env.DB.prepare('INSERT INTO league_messages (team_id, body, created_at) VALUES (?, ?, ?) RETURNING id, created_at').bind(me.id, text, Date.now()).first();
+  await env.DB.prepare(`INSERT INTO league_reads (team_id, last_id) VALUES (?, ?)
+    ON CONFLICT(team_id) DO UPDATE SET last_id = MAX(last_id, excluded.last_id)`).bind(me.id, r.id).run();
+  return { ok: true };
+}
+
+async function chatPartner(env, me, otherId) {
+  if (otherId === me.id) throw new HttpError(400, "You can't message your own team.");
+  const other = await env.DB.prepare('SELECT id, name, owner, logo_v FROM teams WHERE id = ?').bind(otherId).first();
+  if (!other) throw new HttpError(404, 'Team not found.');
+  return other;
+}
+
+async function apiChat(env, me, otherId, after) {
+  const other = await chatPartner(env, me, otherId);
+  const pair = '((from_team = ?1 AND to_team = ?2) OR (from_team = ?2 AND to_team = ?1))';
+  const rows = after > 0
+    ? (await env.DB.prepare(`SELECT id, from_team, body, created_at FROM messages WHERE ${pair} AND id > ?3 ORDER BY id LIMIT 100`).bind(me.id, otherId, after).all()).results
+    : (await env.DB.prepare(`SELECT id, from_team, body, created_at FROM messages WHERE ${pair} ORDER BY id DESC LIMIT 60`).bind(me.id, otherId).all()).results.reverse();
+  if (rows.some((r) => r.from_team === otherId)) {
+    await env.DB.prepare('UPDATE messages SET read_at = ? WHERE to_team = ? AND from_team = ? AND read_at IS NULL').bind(Date.now(), me.id, otherId).run();
+  }
+  return {
+    team: other,
+    messages: rows.map((r) => ({ id: r.id, mine: r.from_team === me.id, body: r.body, created_at: r.created_at })),
+  };
+}
+
+async function apiSendChat(env, me, otherId, { body }) {
+  await chatPartner(env, me, otherId);
+  const text = String(body || '').trim();
+  if (!text) throw new HttpError(400, 'Type a message first.');
+  if (text.length > 500) throw new HttpError(400, 'Messages can be up to 500 characters.');
+  const r = await env.DB.prepare('INSERT INTO messages (from_team, to_team, body, created_at) VALUES (?, ?, ?, ?) RETURNING id, created_at')
+    .bind(me.id, otherId, text, Date.now()).first();
+  return { ok: true, message: { id: r.id, mine: true, body: text, created_at: r.created_at } };
 }
 
 // ---------------------------------------------------------------- owner actions

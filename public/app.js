@@ -11,6 +11,7 @@ const state = {
   editTeam: null,
   firstWeek: 1,
   online: { owners: [], guests: 0 },
+  unread: { total: 0, from: [], league: 0 },
   presenceOpen: false,
 };
 // Upcoming bye, in league week numbers. Shows nothing once the bye has passed.
@@ -95,6 +96,17 @@ async function loadMe() {
   }
   const link = document.getElementById('my-team-link');
   link.hidden = !state.me;
+  let chatTab = document.getElementById('league-chat-link');
+  if (!chatTab) {
+    chatTab = document.createElement('a');
+    chatTab.id = 'league-chat-link';
+    chatTab.href = '#chat';
+    chatTab.dataset.view = 'chat';
+    chatTab.innerHTML = 'League Chat<span class="nav-badge" id="league-badge" hidden></span>';
+    document.querySelector('.top-nav').appendChild(chatTab);
+  }
+  chatTab.hidden = !state.me;
+  if (state.me) setTimeout(checkUnread, 500);
   if (state.me) link.href = `#team/${state.me.id}`;
 }
 
@@ -173,31 +185,162 @@ async function heartbeat() {
   } catch { /* presence is best-effort */ }
 }
 
+const CHAT_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20.5l1.4-4.9A8 8 0 1 1 21 12z"/></svg>';
+
 function renderPresence() {
   const el = document.getElementById('presence');
   const { owners, guests } = state.online;
   const others = owners.filter((o) => !state.me || o.team_id !== state.me.id);
   const total = owners.length + guests;
-  if (!total) { el.innerHTML = ''; return; }
+  const unread = state.me ? state.unread.total : 0;
+  if (!total && !unread) { el.innerHTML = ''; return; }
   const shown = owners.slice(0, 4);
   const extra = owners.length - shown.length;
   const label = others.length ? `${others.length} other owner${others.length > 1 ? 's' : ''} online` : (guests ? `${total} viewing` : 'Just you');
+  const unreadFrom = (id) => (state.unread.from.find((u) => u.team_id === id) || {}).count || 0;
+  const offlineUnread = state.me ? state.unread.from.filter((u) => !owners.some((o) => o.team_id === u.team_id)) : [];
+  const row = (o, online) => {
+    const n = unreadFrom(o.team_id);
+    const canChat = state.me && o.team_id !== state.me.id;
+    return `<li><a href="#team/${o.team_id}">${avatar(o)}<span style="min-width:0">
+        <span class="pp-name">${esc(o.owner || o.team)}${state.me && o.team_id === state.me.id ? ' (you)' : ''}</span>
+        <div class="pp-sub">${o.owner ? `${esc(o.team)}. ` : ''}${online ? esc(PAGE_LABEL[o.page] || 'Browsing') : 'Offline'}</div></span></a>
+        ${canChat ? `<button class="chat-btn" data-chat="${o.team_id}" aria-label="Chat with ${esc(o.owner || o.team)}" title="Chat">${CHAT_ICON}${n ? `<span class="chat-count">${n}</span>` : ''}</button>` : ''}</li>`;
+  };
   el.innerHTML = `
     <button class="presence-btn ${shown.length ? '' : 'solo'}" id="presence-btn" aria-expanded="${state.presenceOpen}" aria-controls="presence-pop">
       ${shown.length ? `<span class="avatars">${shown.map(avatar).join('')}${extra > 0 ? `<span class="avatar more">+${extra}</span>` : ''}</span>` : '<span class="live-dot" aria-hidden="true"></span>'}
       <span class="pl-long">${label}</span><span class="pl-short">${total} online</span>
+      ${unread ? `<span class="pill-unread" aria-label="${unread} unread message${unread > 1 ? 's' : ''}">${unread}</span>` : ''}
     </button>
     ${state.presenceOpen ? `<div class="presence-pop" id="presence-pop">
+      ${offlineUnread.length ? `<h4>New messages</h4><ul>${offlineUnread.map((u) => row(u, false)).join('')}</ul>` : ''}
       <h4>Online now</h4>
-      <ul>${owners.map((o) => `<li><a href="#team/${o.team_id}">${avatar(o)}<span style="min-width:0">
-        <span class="pp-name">${esc(o.owner || o.team)}${state.me && o.team_id === state.me.id ? ' (you)' : ''}</span>
-        <div class="pp-sub">${o.owner ? `${esc(o.team)}. ` : ''}${esc(PAGE_LABEL[o.page] || 'Browsing')}</div></span></a></li>`).join('') || '<li class="muted" style="font-size:12px">No owners online yet.</li>'}</ul>
+      <ul>${owners.map((o) => row(o, true)).join('') || '<li class="muted" style="font-size:12px">No owners online yet.</li>'}</ul>
       ${guests ? `<div class="pp-guests">${guests} guest${guests > 1 ? 's' : ''} watching without a team link</div>` : ''}
+      ${!state.me && others.length ? '<div class="pp-guests">Open your team link to chat with other owners.</div>' : ''}
     </div>` : ''}`;
   document.getElementById('presence-btn').onclick = (e) => { e.stopPropagation(); state.presenceOpen = !state.presenceOpen; renderPresence(); };
+  el.querySelectorAll('[data-chat]').forEach((b) => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    state.presenceOpen = false;
+    renderPresence();
+    openChat(Number(b.dataset.chat));
+  }));
   // Green dots next to team names that are online right now.
   document.querySelectorAll('[data-team-id]').forEach((n) => n.classList.toggle('is-online', isOnline(Number(n.dataset.teamId))));
 }
+
+// ------------------------------------------------------------ chat
+const chat = { teamId: null, lastId: 0, timer: null, sending: false };
+const chatTime = (ms) => new Date(ms).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+
+async function checkUnread() {
+  if (!state.me || document.hidden) return;
+  try {
+    const prev = state.unread.total;
+    const u = await api('/api/me/unread');
+    state.unread = u;
+    const badge = document.getElementById('league-badge');
+    const onChatPage = location.hash.startsWith('#chat');
+    if (badge) { badge.hidden = !u.league || onChatPage; badge.textContent = u.league > 99 ? '99+' : u.league; }
+    const fresh = u.from.find((f) => f.team_id !== chat.teamId);
+    if (u.total > prev && fresh) chatNotice(fresh);
+    document.title = document.title.replace(/^\(\d+\) /, '');
+    const allUnread = u.total + (location.hash.startsWith('#chat') ? 0 : u.league);
+    if (allUnread) document.title = `(${allUnread}) ${document.title}`;
+    renderPresence();
+  } catch { /* best-effort */ }
+}
+setInterval(checkUnread, 15000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) checkUnread(); });
+
+function chatNotice(from) {
+  let n = document.getElementById('chat-notice');
+  if (!n) { n = document.createElement('div'); n.id = 'chat-notice'; n.setAttribute('role', 'status'); document.body.appendChild(n); }
+  n.innerHTML = `${avatar(from)}<span>New message from <b>${esc(from.owner || from.team)}</b></span><button class="btn primary sm" data-open-chat="${from.team_id}">Open</button><button class="chat-x" aria-label="Dismiss">&times;</button>`;
+  n.className = 'show';
+  n.querySelector('[data-open-chat]').onclick = () => { n.className = ''; openChat(from.team_id); };
+  n.querySelector('.chat-x').onclick = () => { n.className = ''; };
+  clearTimeout(chatNotice._t);
+  chatNotice._t = setTimeout(() => { n.className = ''; }, 10000);
+}
+
+function closeChat() {
+  clearInterval(chat.timer);
+  chat.teamId = null;
+  document.getElementById('chat-panel')?.remove();
+}
+
+async function openChat(teamId) {
+  if (!state.me) return;
+  closeChat();
+  chat.teamId = teamId;
+  chat.lastId = 0;
+  const panel = document.createElement('div');
+  panel.id = 'chat-panel';
+  panel.className = 'chat-panel';
+  panel.setAttribute('role', 'dialog');
+  panel.innerHTML = '<div class="chat-head"><span class="muted">Loading chat</span><button class="chat-x" aria-label="Close chat">&times;</button></div><div class="chat-body" id="chat-body"></div>';
+  document.body.appendChild(panel);
+  panel.querySelector('.chat-x').onclick = closeChat;
+  try {
+    const d = await api(`/api/me/chats/${teamId}`);
+    if (chat.teamId !== teamId) return;
+    const t = d.team;
+    const who = { team_id: t.id, team: t.name, owner: t.owner, logo_v: t.logo_v };
+    panel.setAttribute('aria-label', `Chat with ${t.owner || t.name}`);
+    panel.innerHTML = `
+      <div class="chat-head">${avatar(who)}<span class="chat-who"><b>${esc(t.owner || t.name)}</b><span class="pmeta">${t.owner ? esc(t.name) : ''}${isOnline(t.id) ? ' <span class="live-dot"></span> Online' : ''}</span></span>
+        <button class="chat-x" aria-label="Close chat">&times;</button></div>
+      <div class="chat-body" id="chat-body" aria-live="polite"></div>
+      <form class="chat-form" id="chat-form"><textarea id="chat-input" rows="1" maxlength="500" placeholder="Message ${esc(t.owner || t.name)}" aria-label="Message"></textarea><button class="btn primary sm" type="submit">Send</button></form>`;
+    panel.querySelector('.chat-x').onclick = closeChat;
+    appendMessages(d.messages, true);
+    const input = document.getElementById('chat-input');
+    input.focus();
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); document.getElementById('chat-form').requestSubmit(); } });
+    document.getElementById('chat-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const text = input.value.trim();
+      if (!text || chat.sending) return;
+      chat.sending = true;
+      try {
+        const r = await api(`/api/me/chats/${teamId}`, { method: 'POST', body: { body: text } });
+        input.value = '';
+        appendMessages([r.message]);
+      } catch (err) { toast(err.message, 'error'); }
+      chat.sending = false;
+    });
+    checkUnread();
+    chat.timer = setInterval(async () => {
+      if (document.hidden || chat.teamId !== teamId) return;
+      try {
+        const n = await api(`/api/me/chats/${teamId}?after=${chat.lastId}`);
+        if (n.messages.length) { appendMessages(n.messages); checkUnread(); }
+      } catch { /* retry next tick */ }
+    }, 3000);
+  } catch (e) {
+    panel.querySelector('.chat-head span').textContent = e.message;
+  }
+}
+
+function appendMessages(msgs, first) {
+  const body = document.getElementById('chat-body');
+  if (!body) return;
+  if (first && !msgs.length) body.innerHTML = '<p class="chat-empty">No messages yet. Say hello.</p>';
+  for (const m of msgs) {
+    if (m.id <= chat.lastId) continue;
+    body.querySelector('.chat-empty')?.remove();
+    chat.lastId = m.id;
+    const div = document.createElement('div');
+    div.className = `chat-msg ${m.mine ? 'mine' : 'theirs'}`;
+    div.innerHTML = `<div class="chat-bubble">${esc(m.body)}</div><div class="chat-time">${chatTime(m.created_at)}</div>`;
+    body.appendChild(div);
+  }
+  body.scrollTop = body.scrollHeight;
+}
+
 document.addEventListener('click', (e) => {
   if (state.presenceOpen && !e.target.closest('#presence')) { state.presenceOpen = false; renderPresence(); }
 });
@@ -240,6 +383,7 @@ async function router() {
     else if (view === 'players') await renderPlayers();
     else if (view === 'graveyard') { location.replace('#live'); return; }
     else if (view === 'activity') await renderActivity();
+    else if (view === 'chat') { await renderLeagueChat(); state.timer = setInterval(() => pollLeagueChat().catch(() => {}), 4000); }
     else if (view === 'admin') await renderAdmin();
     else location.replace('#live');
   } catch (e) {
@@ -602,6 +746,71 @@ async function renderActivity() {
       <li><span><b>${esc(x.team || 'League')}</b> ${esc(label[x.type] || x.type)} ${x.player ? `<b>${esc(x.player)}</b> <span class="muted">${esc(x.pos || '')}</span>` : ''} ${x.detail ? `<span class="muted">${esc(x.detail)}</span>` : ''}</span>
       <span class="muted" style="white-space:nowrap">${new Date(`${x.created_at.replace(' ', 'T')}Z`).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</span></li>`).join('')}</ul></div>`
     : '<div class="panel"><p>No moves yet.</p></div>'}`;
+}
+
+// ------------------------------------------------------------ league chat
+const league = { lastId: 0, sending: false };
+
+async function renderLeagueChat() {
+  document.title = 'League Chat';
+  if (!state.me) {
+    $app.innerHTML = `<section class="hero"><h1>League <em>Chat</em></h1><p>Trash talk, trade talk and everything in between.</p></section>
+      <div class="panel"><p class="muted">Open the private team link from the commissioner to join the league chat.</p></div>`;
+    return;
+  }
+  league.lastId = 0;
+  $app.innerHTML = `<section class="hero"><h1>League <em>Chat</em></h1><p>Every owner in the league sees this room.</p></section>
+    <div class="league-chat panel">
+      <div class="lc-body" id="lc-body" aria-live="polite"><p class="muted lc-empty">Loading messages</p></div>
+      <form class="chat-form lc-form" id="lc-form">
+        <textarea id="lc-input" rows="1" maxlength="500" placeholder="Message the league" aria-label="Message the league"></textarea>
+        <button class="btn primary" type="submit">Send</button>
+      </form>
+    </div>`;
+  const d = await api('/api/me/league-chat');
+  const body = document.getElementById('lc-body');
+  body.innerHTML = d.messages.length ? '' : '<p class="muted lc-empty">No messages yet. Get the trash talk started.</p>';
+  appendLeague(d.messages);
+  const input = document.getElementById('lc-input');
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); document.getElementById('lc-form').requestSubmit(); } });
+  document.getElementById('lc-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text || league.sending) return;
+    league.sending = true;
+    try {
+      await api('/api/me/league-chat', { method: 'POST', body: { body: text } });
+      input.value = '';
+      await pollLeagueChat();
+    } catch (err) { toast(err.message, 'error'); }
+    league.sending = false;
+    input.focus();
+  });
+  checkUnread();
+}
+
+async function pollLeagueChat() {
+  if (document.hidden || !document.getElementById('lc-body')) return;
+  const d = await api(`/api/me/league-chat?after=${league.lastId}`);
+  if (d.messages.length) { appendLeague(d.messages); checkUnread(); }
+}
+
+function appendLeague(msgs) {
+  const body = document.getElementById('lc-body');
+  if (!body) return;
+  const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 80;
+  for (const m of msgs) {
+    if (m.id <= league.lastId) continue;
+    body.querySelector('.lc-empty')?.remove();
+    league.lastId = m.id;
+    const div = document.createElement('div');
+    div.className = `lc-msg ${m.mine ? 'mine' : ''}`;
+    div.innerHTML = `${teamLogo(m.team_id, m.logo_v, m.team || '?', 'sm')}
+      <div class="lc-main"><div class="lc-who"><b>${esc(m.owner || m.team || 'Former team')}</b> <span class="pmeta">${m.owner ? esc(m.team) : ''} ${chatTime(m.created_at)}</span></div>
+      <div class="lc-text">${esc(m.body)}</div></div>`;
+    body.appendChild(div);
+  }
+  if (nearBottom || msgs.some((m) => m.mine)) body.scrollTop = body.scrollHeight;
 }
 
 // ------------------------------------------------------------ commissioner
